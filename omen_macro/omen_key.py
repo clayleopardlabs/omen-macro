@@ -50,16 +50,26 @@ def normalize_paths(value) -> list[str]:
     return [str(p) for p in items if str(p)]
 
 
+def ensure_binding_path(paths: list[str], path: str) -> list[str]:
+    """Return paths with path present exactly once, order preserved."""
+    out = [p for p in paths if p != path]
+    out.append(path)
+    return out
+
+
+def remove_binding_path(paths: list[str], path: str) -> list[str]:
+    """Return paths with every path entry removed, order preserved."""
+    return [p for p in paths if p != path]
+
+
 def ensure_omen_path(paths: list[str]) -> list[str]:
     """Return paths with OMEN_PATH present exactly once, order preserved."""
-    out = [p for p in paths if p != OMEN_PATH]
-    out.append(OMEN_PATH)
-    return out
+    return ensure_binding_path(paths, OMEN_PATH)
 
 
 def remove_omen_path(paths: list[str]) -> list[str]:
     """Return paths with every OMEN_PATH entry removed, order preserved."""
-    return [p for p in paths if p != OMEN_PATH]
+    return remove_binding_path(paths, OMEN_PATH)
 
 
 def binding_payload(name: str, command: str) -> dict:
@@ -211,3 +221,139 @@ def set_omen_key(command: str, name: str = OMEN_DEFAULT_NAME) -> dict:
 def clear_omen_key() -> None:
     """Remove the OMEN entry from the shortcut list (values are left inert)."""
     set_custom_paths(remove_omen_path(get_custom_paths()))
+
+
+# --------------------------------------------------------------------------- #
+# Per-key commands: P1..P6 reuse the same mechanism with KP_1..KP_6
+#
+# A P-key whose EC slot holds a macro types that macro, so a GNOME shortcut on
+# the same keysym would fight it. The GUI therefore leaves a command-bound
+# key's EC slot out of the uploaded table (see gui._profile_config): the key
+# runs the command instead of typing. Fn+P combinations are unaffected, they
+# still replay their own slots.
+# --------------------------------------------------------------------------- #
+COMMANDABLE_PKEYS = ("P1", "P2", "P3", "P4", "P5", "P6")
+COMMANDABLE_KEYS = COMMANDABLE_PKEYS + ("OMEN",)
+
+
+def key_accel(key: str) -> str:
+    """Accelerator string for key: KP_1..KP_6, or XF86Launch2 for OMEN."""
+    if key == "OMEN":
+        return OMEN_ACCEL
+    return "KP_" + key[1:]
+
+
+def key_path(key: str) -> str:
+    """dconf object path owned by the GUI for key."""
+    if key == "OMEN":
+        return OMEN_PATH
+    return ("/org/gnome/settings-daemon/plugins/media-keys/"
+            f"custom-keybindings/omen-macro-{key.lower()}/")
+
+
+def key_display_name(key: str) -> str:
+    """Human name stored in the shortcut object."""
+    if key == "OMEN":
+        return OMEN_DEFAULT_NAME
+    return f"{key} macro key"
+
+
+def get_binding(path: str) -> dict | None:
+    """Return the current {name, command, binding} for path, or None."""
+    settings = _gio_settings(CUSTOM_SCHEMA, path)
+    if settings is not None:
+        try:
+            name = settings.get_string("name")
+            command = settings.get_string("command")
+            binding = settings.get_string("binding")
+        except Exception as exc:
+            raise OSError(f"cannot read shortcut {path}: {exc}") from None
+        if not name and not command and not binding:
+            return None
+        return {"name": name, "command": command, "binding": binding}
+    name = _gsettings_cli("get", f"{CUSTOM_SCHEMA}:{path}", "name")
+    command = _gsettings_cli("get", f"{CUSTOM_SCHEMA}:{path}", "command")
+    binding = _gsettings_cli("get", f"{CUSTOM_SCHEMA}:{path}", "binding")
+    if name is None or command is None or binding is None:
+        raise OSError(f"cannot read shortcut {path} (no Gio, no gsettings)")
+    return {"name": name.strip("'"), "command": command.strip("'"),
+            "binding": binding.strip("'")}
+
+
+def set_binding(path: str, name: str, command: str, binding: str) -> dict:
+    """Write one custom shortcut object and list it. Returns the payload."""
+    payload = {"name": name, "command": command, "binding": binding}
+    settings = _gio_settings(CUSTOM_SCHEMA, path)
+    if settings is not None:
+        try:
+            settings.set_string("name", name)
+            settings.set_string("command", command)
+            settings.set_string("binding", binding)
+            set_custom_paths(ensure_binding_path(get_custom_paths(), path))
+            return payload
+        except OSError:
+            raise
+        except Exception as exc:
+            raise OSError(f"cannot write shortcut {path}: {exc}") from None
+    for k, val in payload.items():
+        if _gsettings_cli("set", f"{CUSTOM_SCHEMA}:{path}", k, val) is None:
+            raise OSError("cannot write shortcut (no Gio, no gsettings)")
+    set_custom_paths(ensure_binding_path(get_custom_paths(), path))
+    return payload
+
+
+def get_key_binding(key: str) -> dict | None:
+    """Live shortcut for key ("P1".."P6", "OMEN"), or None when unbound."""
+    data = get_binding(key_path(key))
+    paths = get_custom_paths()
+    if key_path(key) not in paths or not data or not data.get("command"):
+        return None
+    return data
+
+
+def set_key_command(key: str, command: str) -> dict:
+    """Bind key's keysym to command. Returns the payload that was written."""
+    command = (command or "").strip()
+    if not command:
+        raise ValueError("command must not be empty")
+    if key not in COMMANDABLE_KEYS:
+        raise ValueError(f"cannot bind {key!r}")
+    return set_binding(key_path(key), key_display_name(key), command,
+                       key_accel(key))
+
+
+def clear_key_command(key: str) -> None:
+    """Remove key's entry from the shortcut list (values are left inert)."""
+    set_custom_paths(remove_binding_path(get_custom_paths(), key_path(key)))
+
+
+def normalize_commands(cfg: dict) -> tuple[dict, list[str]]:
+    """Split config into ({key: command}, [problems]).
+
+    Accepts the current "commands" object and the legacy "omen_key" object
+    from before per-key commands existed; legacy OMEN entries migrate.
+    Pure: no dconf access, unit-tested.
+    """
+    commands: dict[str, str] = {}
+    problems: list[str] = []
+    raw = cfg.get("commands")
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        problems.append("commands is not an object")
+        raw = {}
+    for name, cmd in raw.items():
+        if name not in COMMANDABLE_KEYS:
+            problems.append(f"unknown command key {name!r}")
+            continue
+        if not isinstance(cmd, str) or not cmd.strip():
+            problems.append(f"command for {name} is not a text string")
+            continue
+        commands[name] = cmd.strip()
+    legacy = cfg.get("omen_key")
+    if isinstance(legacy, dict) and isinstance(legacy.get("command"), str):
+        if "OMEN" not in commands and legacy["command"].strip():
+            commands["OMEN"] = legacy["command"].strip()
+    elif legacy is not None:
+        problems.append("omen_key is not an object with a command string")
+    return commands, problems

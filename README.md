@@ -112,14 +112,35 @@ omen-macro-apply --clear # all slots empty
 omen-macro-apply --dry-run # encode + summarise, touch nothing
 ```
 
-### OMEN key (logo button)
+### Per-key commands (run a program instead of typing)
 
-The logo key is not an EC macro slot. It always sends KEY_PROG2 (XF86Launch2),
-so there is nothing to upload to the EC. The GUI lists it as an "OMEN" row
-right after P6: Set opens a dialog for the command it should run (default
-`omen-macro`), Clear removes the shortcut. The GUI owns one GNOME custom
-shortcut for this and leaves your other shortcuts alone. The choice is stored
-in profile.json under `omen_key`.
+Every P-key row and the OMEN row have a command option alongside the macro:
+
+- P1-P6: the Cmd button binds KP_1-KP_6 to any command you type. While a
+  command is set, that key's typing macro is left out of the EC upload, so the
+  key runs the command instead of typing. Press Apply to EC to make the switch
+  take effect. Fn+P combinations still replay their own slots. Note: a USB
+  keyboard with a real numpad sends the same keysyms, so it would also trigger
+  these shortcuts.
+- OMEN (logo key): the logo key is not an EC macro slot. It always sends
+  KEY_PROG2 (XF86Launch2), so there is nothing to upload. Set opens a dialog
+  for the command it should run (default `omen-macro`), Clear removes the
+  shortcut.
+
+The GUI owns one GNOME custom shortcut per configured key and leaves your
+other shortcuts alone. Commands are stored in profile.json under `commands`
+and survive reboot like the macros. Older files using `omen_key` still load.
+
+### What the buttons do
+
+- Apply to EC: sends this window's macros to the keyboard controller right
+  now. Works immediately, but the controller forgets the table when the power
+  is off.
+- Save: stores this window (macros, spacing, commands) to profile.json. The
+  boot service re-applies that file at startup. Does not touch the keyboard.
+- Save & Apply: Save, then Apply to EC.
+- Load defaults: replaces this window with the stock numpad layout. Nothing
+  is saved or sent until you Save or Apply.
 
 ## Limitations
 

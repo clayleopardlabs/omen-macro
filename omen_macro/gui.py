@@ -36,8 +36,9 @@ Files
                         OMEN_MACRO_CONFIG overrides the full file path.
 
     The OMEN logo key is not an EC slot: it always reports KEY_PROG2
-    (XF86Launch2). The GUI configures it by owning one GNOME custom shortcut
-    that runs a command of your choice (see omen_key.py).
+    (XF86Launch2). Any key (OMEN or P1..P6) can instead run a command through
+    one GNOME custom shortcut per key (see omen_key.py); a command-bound
+    P-key's typing macro is left out of the EC upload so the two do not fight.
 """
 
 from __future__ import annotations
@@ -325,7 +326,7 @@ class MacroWindow(Gtk.ApplicationWindow):
 
         self.slots: dict[str, list[list[str]]] = {}
         self.rows: dict[str, dict[str, Gtk.Widget]] = {}
-        self.omen_command: str = omen_key.OMEN_DEFAULT_COMMAND
+        self.commands: dict[str, str] = {}
         self.recording: Recording | None = None
         self.recording_slot: str | None = None
         self._config_line = f"config: {config_path()}"
@@ -405,7 +406,7 @@ class MacroWindow(Gtk.ApplicationWindow):
         main_list.set_selection_mode(Gtk.SelectionMode.NONE)
         main_list.set_show_separators(True)
         for slot in codec.PRIMARY_SLOTS:
-            self._add_row(main_list, slot)
+            self._add_row(main_list, slot, with_command=True)
         self._add_omen_row(main_list)
         content.append(main_list)
 
@@ -413,8 +414,9 @@ class MacroWindow(Gtk.ApplicationWindow):
         content.append(self._build_advanced())
         return content
 
-    def _add_row(self, listbox: Gtk.ListBox, slot: str) -> None:
-        """Append one [name | summary | Record | Clear] row to ``listbox``."""
+    def _add_row(self, listbox: Gtk.ListBox, slot: str,
+                 with_command: bool = False) -> None:
+        """Append one [name | summary | Record | Cmd? | Clear] row to ``listbox``."""
         row = Gtk.ListBoxRow()
         row.add_css_class("macro-row")
 
@@ -431,14 +433,31 @@ class MacroWindow(Gtk.ApplicationWindow):
         summary.set_ellipsize(Pango.EllipsizeMode.END)
 
         record = Gtk.Button(label="Record")
-        record.set_tooltip_text(f"Record the macro for {slot}")
+        record.set_tooltip_text(f"Record the keystrokes the EC replays for {slot}")
         record.connect("clicked", lambda _btn, s=slot: self._on_record_clicked(s))
+
+        widgets: list[Gtk.Widget] = [name_label, summary, record]
+
+        cmd_btn = None
+        if with_command:
+            cmd_btn = Gtk.Button(label="Cmd")
+            cmd_btn.set_tooltip_text(
+                f"Run a command when {slot} is pressed instead of typing "
+                f"(uses the {omen_key.key_accel(slot)} shortcut)"
+            )
+            cmd_btn.connect("clicked", lambda _btn, s=slot: self._on_cmd_clicked(s))
+            widgets.append(cmd_btn)
 
         clear = Gtk.Button(label="Clear")
         clear.set_tooltip_text(f"Remove the macro for {slot}")
+        if with_command:
+            clear.set_tooltip_text(
+                f"Remove the macro and the command for {slot} (key does nothing)"
+            )
         clear.connect("clicked", lambda _btn, s=slot: self._on_clear_clicked(s))
+        widgets.append(clear)
 
-        for widget in (name_label, summary, record, clear):
+        for widget in widgets:
             box.append(widget)
         row.set_child(box)
         listbox.append(row)
@@ -447,6 +466,7 @@ class MacroWindow(Gtk.ApplicationWindow):
             "summary": summary,
             "record": record,
             "clear": clear,
+            "cmd": cmd_btn,
         }
 
     def _build_spacing_row(self) -> Gtk.Widget:
@@ -555,8 +575,15 @@ class MacroWindow(Gtk.ApplicationWindow):
         row["summary"].set_text(text)
         row["summary"].set_tooltip_text(text)
 
-    def _on_omen_set_clicked(self, _button) -> None:
-        dialog = Gtk.Window(transient_for=self, modal=True, title="OMEN key command")
+    def _open_command_dialog(self, key: str) -> None:
+        """Dialog to set the command run when key is pressed.
+
+        key is "OMEN" or "P1".."P6". The command is stored in this window and
+        written to GNOME shortcuts on Bind; Save persists it to profile.json.
+        """
+        is_omen = key == "OMEN"
+        title = "OMEN key command" if is_omen else f"{key} command"
+        dialog = Gtk.Window(transient_for=self, modal=True, title=title)
         dialog.set_default_size(420, -1)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         for side in ("top", "bottom", "start", "end"):
@@ -564,22 +591,33 @@ class MacroWindow(Gtk.ApplicationWindow):
 
         label = Gtk.Label(xalign=0)
         label.set_wrap(True)
-        label.set_text(
-            "Command run when the OMEN logo key is pressed (it sends XF86Launch2)."
-        )
+        if is_omen:
+            label.set_text(
+                "Command run when the OMEN logo key is pressed "
+                "(it sends XF86Launch2)."
+            )
+        else:
+            label.set_text(
+                f"Command run when {key} is pressed (it sends "
+                f"{omen_key.key_accel(key)}). While a command is set, the "
+                "typing macro for this key is left out of the EC upload: "
+                "press Apply to EC to make the switch take effect."
+            )
         box.append(label)
 
         entry = Gtk.Entry()
         entry.set_hexpand(True)
-        current = (self.omen_command or "").strip()
+        current = (self.commands.get(key) or "").strip()
         if not current:
             try:
-                data = omen_key.get_omen_binding()
+                data = omen_key.get_key_binding(key)
                 if data and data.get("command"):
                     current = data["command"]
             except OSError:
                 pass
-        entry.set_text(current or omen_key.OMEN_DEFAULT_COMMAND)
+        entry.set_text(current or
+                       (omen_key.OMEN_DEFAULT_COMMAND if is_omen else ""))
+        entry.set_placeholder_text("e.g. firefox" if not is_omen else "e.g. omen-macro")
         box.append(entry)
 
         buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -596,21 +634,31 @@ class MacroWindow(Gtk.ApplicationWindow):
             if bind:
                 command = entry.get_text().strip()
                 if not command:
-                    self._set_banner("OMEN key: type a command first.", "banner-error")
-                    return
-                try:
-                    omen_key.set_omen_key(command)
-                except (OSError, ValueError) as exc:
                     self._set_banner(
-                        f"OMEN key: could not save the shortcut ({exc})", "banner-error"
+                        f"{key}: type a command first.", "banner-error"
                     )
                     return
-                self.omen_command = command
+                try:
+                    omen_key.set_key_command(key, command)
+                except (OSError, ValueError) as exc:
+                    self._set_banner(
+                        f"{key}: could not save the shortcut ({exc})",
+                        "banner-error",
+                    )
+                    return
+                self.commands[key] = command
                 self._set_banner("", "")
-                self._refresh_omen_status()
-                self._set_status(
-                    f"OMEN key now runs {command!r} (saved to GNOME shortcuts)."
-                )
+                if is_omen:
+                    self._refresh_omen_status()
+                    self._set_status(
+                        f"OMEN key now runs {command!r} (saved to GNOME shortcuts)."
+                    )
+                else:
+                    self._refresh_row(key)
+                    self._set_status(
+                        f"{key} now runs {command!r}. Press Apply to EC so "
+                        "its typing macro stops competing with it."
+                    )
             dialog.close()
 
         cancel.connect("clicked", lambda _b: done(False))
@@ -618,12 +666,22 @@ class MacroWindow(Gtk.ApplicationWindow):
         entry.connect("activate", lambda _e: done(True))
         dialog.present()
 
+    def _on_cmd_clicked(self, slot: str) -> None:
+        self._finish_recording()
+        self._open_command_dialog(slot)
+
+    def _on_omen_set_clicked(self, _button) -> None:
+        self._finish_recording()
+        self._open_command_dialog("OMEN")
+
     def _on_omen_remove_clicked(self, _button) -> None:
+        self._finish_recording()
         try:
-            omen_key.clear_omen_key()
+            omen_key.clear_key_command("OMEN")
         except OSError as exc:
             self._set_banner(f"OMEN key: could not remove the shortcut ({exc})", "banner-error")
             return
+        self.commands.pop("OMEN", None)
         self._set_banner("", "")
         self._refresh_omen_status()
         self._set_status("OMEN key binding removed.")
@@ -645,25 +703,47 @@ class MacroWindow(Gtk.ApplicationWindow):
         return frame
 
     def _build_footer(self) -> Gtk.Widget:
+        footer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+
+        hint = Gtk.Label(xalign=0)
+        hint.set_wrap(True)
+        hint.add_css_class("dim-label")
+        hint.set_text(
+            "Apply sends this window to the keyboard now (the EC forgets it "
+            "on reboot). Save stores this window to profile.json, which the "
+            "boot service re-applies. Save & Apply does both."
+        )
+        footer.append(hint)
+
         bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
 
         self.apply_btn = Gtk.Button(label="Apply to EC")
         self.apply_btn.add_css_class("suggested-action")
         self.apply_btn.set_tooltip_text(
-            "Encode the table and write all 4096 bytes to the EC now."
+            "Send this window's macros to the keyboard controller now. "
+            "Works immediately, but the controller forgets it when the "
+            "power is off - Save first if you want it to survive reboot."
         )
         self.apply_btn.connect("clicked", self._on_apply_clicked)
 
         self.save_btn = Gtk.Button(label="Save")
-        self.save_btn.set_tooltip_text(f"Save the configuration to {config_path()}")
+        self.save_btn.set_tooltip_text(
+            f"Store this window to {config_path()}. The boot service "
+            "re-applies that file at startup. Does not touch the keyboard now."
+        )
         self.save_btn.connect("clicked", self._on_save_clicked)
 
         self.save_apply_btn = Gtk.Button(label="Save & Apply")
-        self.save_apply_btn.set_tooltip_text("Save the configuration, then write it to the EC")
+        self.save_apply_btn.set_tooltip_text(
+            "Save to profile.json and send to the keyboard now."
+        )
         self.save_apply_btn.connect("clicked", self._on_save_apply_clicked)
 
         self.defaults_btn = Gtk.Button(label="Load defaults")
-        self.defaults_btn.set_tooltip_text("Load the stock numpad layout as a starting point")
+        self.defaults_btn.set_tooltip_text(
+            "Replace this window with the stock numpad layout. Nothing is "
+            "saved or sent until you Save or Apply."
+        )
         self.defaults_btn.connect("clicked", self._on_defaults_clicked)
 
         self.stop_btn = Gtk.Button(label="Stop recording")
@@ -679,7 +759,8 @@ class MacroWindow(Gtk.ApplicationWindow):
         spacer.set_hexpand(True)
         bar.append(spacer)
         bar.append(self.stop_btn)
-        return bar
+        footer.append(bar)
+        return footer
 
     def _add_key_controller(self) -> None:
         """Capture every key before shortcuts/widgets see it (capture phase)."""
@@ -772,8 +853,24 @@ class MacroWindow(Gtk.ApplicationWindow):
     def _on_clear_clicked(self, slot: str) -> None:
         if self.recording_slot == slot:
             self._finish_recording()
-        if self.slots.pop(slot, None) is None:
+        macro = self.slots.pop(slot, None)
+        command = self.commands.pop(slot, None)
+        if command is not None:
+            try:
+                omen_key.clear_key_command(slot)
+            except OSError as exc:
+                self.commands[slot] = command  # keep config consistent with dconf
+                self._set_banner(
+                    f"{slot}: could not remove the shortcut ({exc})", "banner-error"
+                )
+                self._refresh_row(slot)
+                return
+        if macro is None and command is None:
             self._set_status(f"{slot} was already empty.")
+        elif command is not None:
+            self._set_status(
+                f"{slot} cleared: macro removed, command {command!r} removed."
+            )
         else:
             self._set_status(f"{slot} cleared (not applied yet - press Apply to EC)")
         self._refresh_row(slot)
@@ -800,11 +897,16 @@ class MacroWindow(Gtk.ApplicationWindow):
         if self.recording_slot == slot:
             return  # the live recording text owns the label
         row = self.rows[slot]
-        text = codec.describe_entry(self.slots.get(slot) or [])
+        command = self.commands.get(slot)
+        if command:
+            text = f"runs {command!r} (typing macro off)"
+            tip = (f"{slot} runs {command!r} instead of typing. "
+                   "Clear removes both the command and the macro.")
+        else:
+            text = codec.describe_entry(self.slots.get(slot) or [])
+            tip = f"{slot} is empty" if text == "empty" else text
         row["summary"].set_text(text)
-        row["summary"].set_tooltip_text(
-            f"{slot} is empty" if text == "empty" else text
-        )
+        row["summary"].set_tooltip_text(tip)
 
     # -- config ------------------------------------------------------------
     def _config(self) -> dict:
@@ -814,9 +916,25 @@ class MacroWindow(Gtk.ApplicationWindow):
             if chords
         }
         cfg: dict = {"spacing_ms": int(self.spacing.get_value()), "slots": slots}
-        command = (getattr(self, "omen_command", "") or "").strip()
-        if command:
-            cfg["omen_key"] = {"command": command, "name": omen_key.OMEN_DEFAULT_NAME}
+        if self.commands:
+            cfg["commands"] = dict(self.commands)
+        return cfg
+
+    def _profile_config(self) -> dict:
+        """Config for the EC upload: command-bound P-keys are left out.
+
+        A key that runs a command must not also type, so its slot is uploaded
+        empty. The saved config keeps both; only the upload is filtered.
+        """
+        cfg = self._config()
+        cmds = cfg.get("commands", {})
+        if cmds:
+            slots = {
+                k: v
+                for k, v in cfg.get("slots", {}).items()
+                if not (k in cmds and k in omen_key.COMMANDABLE_PKEYS)
+            }
+            cfg = {**cfg, "slots": slots}
         return cfg
 
     @staticmethod
@@ -859,13 +977,8 @@ class MacroWindow(Gtk.ApplicationWindow):
             if cleaned:
                 self.slots[name] = cleaned
 
-        raw_omen = cfg.get("omen_key")
-        if isinstance(raw_omen, dict) and isinstance(raw_omen.get("command"), str):
-            command = raw_omen["command"].strip()
-            if command:
-                self.omen_command = command
-        elif raw_omen is not None:
-            problems.append("omen_key is not an object with a command string")
+        self.commands, cmd_problems = omen_key.normalize_commands(cfg)
+        problems.extend(cmd_problems)
 
         self._refresh_all()
         self._refresh_omen_status()
@@ -914,7 +1027,7 @@ class MacroWindow(Gtk.ApplicationWindow):
         sysfs = sysfs_dir()
         path = sysfs / PROFILE_ATTR
         try:
-            profile = codec.config_to_profile(self._config())
+            profile = codec.config_to_profile(self._profile_config())
         except codec.MacroError as exc:
             self._set_banner(f"Cannot encode the macro table: {exc}", "banner-error")
             self._set_status("Profile not written.")
@@ -936,8 +1049,16 @@ class MacroWindow(Gtk.ApplicationWindow):
             return
 
         self._set_banner("", "")
+        skipped = [k for k in omen_key.COMMANDABLE_PKEYS if k in self.commands]
+        note = ""
+        if skipped:
+            note = (
+                f"\n{', '.join(skipped)} run commands, "
+                "so their typing macros were not uploaded."
+            )
         self._set_status(
             f"wrote {written} bytes to {path}\nmacro_status: {read_status(sysfs)}"
+            f"{note}"
         )
 
     def _on_save_clicked(self, _button) -> bool:
@@ -1149,6 +1270,13 @@ def selftest() -> int:
     check("omen payload binds XF86Launch2",
           omen_key.binding_payload("OMEN Key", "omen-macro"),
           {"name": "OMEN Key", "command": "omen-macro", "binding": "XF86Launch2"})
+    check("P-key accel mapping",
+          [omen_key.key_accel(k) for k in ("P1", "P6")], ["KP_1", "KP_6"])
+    check("P-key shortcut paths are unique",
+          len({omen_key.key_path(k) for k in omen_key.COMMANDABLE_KEYS}), 7)
+    migrated, _ = omen_key.normalize_commands(
+        {"omen_key": {"command": "omen-macro"}})
+    check("legacy omen_key migrates", migrated, {"OMEN": "omen-macro"})
 
     print()
     if failures:

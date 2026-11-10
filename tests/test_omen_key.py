@@ -50,6 +50,43 @@ def test_normalize():
     assert omen_key.normalize_paths(["", "a"]) == ["a"]
 
 
+def test_key_accel_and_path():
+    assert omen_key.key_accel("OMEN") == "XF86Launch2"
+    assert omen_key.key_accel("P1") == "KP_1"
+    assert omen_key.key_accel("P6") == "KP_6"
+    assert omen_key.key_path("OMEN") == omen_key.OMEN_PATH
+    assert omen_key.key_path("P1").endswith("/omen-macro-p1/")
+    assert omen_key.key_path("P1") != omen_key.key_path("P2")
+    assert len(set(omen_key.key_path(k) for k in omen_key.COMMANDABLE_KEYS)) == 7
+
+
+def test_general_path_helpers():
+    a, b = "/org/example/a/", "/org/example/b/"
+    assert omen_key.ensure_binding_path([a], b) == [a, b]
+    assert omen_key.ensure_binding_path([a, b], a) == [b, a]
+    assert omen_key.remove_binding_path([a, b], a) == [b]
+
+
+def test_normalize_commands():
+    cmds, problems = omen_key.normalize_commands({})
+    assert cmds == {} and problems == []
+    cmds, problems = omen_key.normalize_commands(
+        {"commands": {"P1": "firefox", "OMEN": "omen-macro"}})
+    assert cmds == {"P1": "firefox", "OMEN": "omen-macro"} and problems == []
+    # legacy omen_key migrates
+    cmds, problems = omen_key.normalize_commands(
+        {"omen_key": {"command": "omen-macro"}})
+    assert cmds == {"OMEN": "omen-macro"} and problems == []
+    # explicit commands win over legacy
+    cmds, _ = omen_key.normalize_commands(
+        {"commands": {"OMEN": "xterm"}, "omen_key": {"command": "omen-macro"}})
+    assert cmds == {"OMEN": "xterm"}
+    # junk is reported, not stored
+    cmds, problems = omen_key.normalize_commands(
+        {"commands": {"P7": "x", "P1": "", "P2": 42}})
+    assert cmds == {} and len(problems) == 3
+
+
 def test_live_read_only():
     """Read-only probe of the real session: must not raise, must not write."""
     try:
