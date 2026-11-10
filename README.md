@@ -112,6 +112,14 @@ omen-macro-apply --clear # all slots empty
 omen-macro-apply --dry-run # encode + summarise, touch nothing
 ```
 
+### OMEN key (logo button)
+
+The logo key is not an EC macro slot. It always sends KEY_PROG2 (XF86Launch2),
+so there is nothing to upload to the EC. The GUI's "OMEN key" section owns one
+GNOME custom shortcut that runs any command you type there (default
+`omen-macro`). Your other shortcuts are left alone. The choice is stored in
+profile.json under `omen_key`, applied with Bind and removed with Remove.
+
 ## Limitations
 
 * The EC replays **PS/2 scan code set 1**. Keys without such a code cannot be

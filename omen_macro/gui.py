@@ -34,6 +34,10 @@ Files
                         boot unit read); falls back to ~/.config/omen-macro/
                         profile.json only while /etc/omen-macro does not exist.
                         OMEN_MACRO_CONFIG overrides the full file path.
+
+    The OMEN logo key is not an EC slot: it always reports KEY_PROG2
+    (XF86Launch2). The GUI configures it by owning one GNOME custom shortcut
+    that runs a command of your choice (see omen_key.py).
 """
 
 from __future__ import annotations
@@ -57,6 +61,7 @@ if str(_PKG_PARENT) not in sys.path:
     sys.path.insert(0, str(_PKG_PARENT))
 
 from omen_macro import codec  # noqa: E402
+from omen_macro import omen_key  # noqa: E402
 
 APP_ID = "io.github.omenmacro.Gui"
 WINDOW_TITLE = "OMEN Macro Keys"
@@ -331,6 +336,7 @@ class MacroWindow(Gtk.ApplicationWindow):
 
         self._refresh_all()
         self._load_config()
+        self._refresh_omen_status()
         self._set_status(
             "\n".join(
                 [
@@ -402,6 +408,7 @@ class MacroWindow(Gtk.ApplicationWindow):
         content.append(main_list)
 
         content.append(self._build_spacing_row())
+        content.append(self._build_omen_key())
         content.append(self._build_advanced())
         return content
 
@@ -486,6 +493,88 @@ class MacroWindow(Gtk.ApplicationWindow):
 
         expander.set_child(inner)
         return expander
+
+    def _build_omen_key(self) -> Gtk.Widget:
+        frame = Gtk.Frame(label="OMEN key (logo button)")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{side}")(6)
+
+        hint = Gtk.Label(xalign=0)
+        hint.set_wrap(True)
+        hint.add_css_class("dim-label")
+        hint.set_text(
+            "The logo key is not an EC macro: it always sends XF86Launch2 "
+            "(KEY_PROG2). Type the command it should run, then Bind it. "
+            "The GUI owns one GNOME custom shortcut for this and leaves "
+            "your other shortcuts alone."
+        )
+        box.append(hint)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.omen_entry = Gtk.Entry()
+        self.omen_entry.set_hexpand(True)
+        self.omen_entry.set_text(omen_key.OMEN_DEFAULT_COMMAND)
+        self.omen_entry.set_tooltip_text(
+            "Command run when the OMEN logo key is pressed"
+        )
+        bind_btn = Gtk.Button(label="Bind OMEN key")
+        bind_btn.set_tooltip_text(
+            "Create or update the GNOME shortcut: XF86Launch2 runs this command"
+        )
+        bind_btn.connect("clicked", self._on_omen_bind_clicked)
+        remove_btn = Gtk.Button(label="Remove")
+        remove_btn.set_tooltip_text("Remove the OMEN key shortcut")
+        remove_btn.connect("clicked", self._on_omen_remove_clicked)
+        row.append(self.omen_entry)
+        row.append(bind_btn)
+        row.append(remove_btn)
+        box.append(row)
+
+        self.omen_status = Gtk.Label(label="", xalign=0)
+        self.omen_status.set_wrap(True)
+        self.omen_status.add_css_class("dim-label")
+        self.omen_status.set_selectable(True)
+        box.append(self.omen_status)
+
+        frame.set_child(box)
+        return frame
+
+    def _refresh_omen_status(self) -> None:
+        try:
+            data = omen_key.get_omen_binding()
+            paths = omen_key.get_custom_paths()
+        except OSError as exc:
+            self.omen_status.set_text(f"OMEN key: could not read shortcuts ({exc})")
+            return
+        if omen_key.OMEN_PATH not in paths or not data or not data.get("command"):
+            self.omen_status.set_text("OMEN key: no binding (pressing it does nothing)")
+            return
+        self.omen_status.set_text(omen_key.describe_binding(data))
+
+    def _on_omen_bind_clicked(self, _button) -> None:
+        command = self.omen_entry.get_text().strip()
+        if not command:
+            self._set_banner("OMEN key: type a command first.", "banner-error")
+            return
+        try:
+            omen_key.set_omen_key(command)
+        except (OSError, ValueError) as exc:
+            self._set_banner(f"OMEN key: could not save the shortcut ({exc})", "banner-error")
+            return
+        self._set_banner("", "")
+        self._refresh_omen_status()
+        self._set_status(f"OMEN key now runs {command!r} (saved to GNOME shortcuts).")
+
+    def _on_omen_remove_clicked(self, _button) -> None:
+        try:
+            omen_key.clear_omen_key()
+        except OSError as exc:
+            self._set_banner(f"OMEN key: could not remove the shortcut ({exc})", "banner-error")
+            return
+        self._set_banner("", "")
+        self._refresh_omen_status()
+        self._set_status("OMEN key binding removed.")
 
     def _build_status_area(self) -> Gtk.Widget:
         frame = Gtk.Frame(label="EC status")
@@ -672,7 +761,13 @@ class MacroWindow(Gtk.ApplicationWindow):
             for name, chords in self.slots.items()
             if chords
         }
-        return {"spacing_ms": int(self.spacing.get_value()), "slots": slots}
+        cfg: dict = {"spacing_ms": int(self.spacing.get_value()), "slots": slots}
+        entry = getattr(self, "omen_entry", None)
+        if entry is not None:
+            command = entry.get_text().strip()
+            if command:
+                cfg["omen_key"] = {"command": command, "name": omen_key.OMEN_DEFAULT_NAME}
+        return cfg
 
     @staticmethod
     def _clean_chords(slot: str, chords) -> list[list[str]]:
@@ -714,7 +809,17 @@ class MacroWindow(Gtk.ApplicationWindow):
             if cleaned:
                 self.slots[name] = cleaned
 
+        raw_omen = cfg.get("omen_key")
+        if isinstance(raw_omen, dict) and isinstance(raw_omen.get("command"), str):
+            command = raw_omen["command"].strip()
+            if command and hasattr(self, "omen_entry"):
+                self.omen_entry.set_text(command)
+        elif raw_omen is not None:
+            problems.append("omen_key is not an object with a command string")
+
         self._refresh_all()
+        if hasattr(self, "omen_status"):
+            self._refresh_omen_status()
         if problems:
             self._set_banner(
                 "Ignored invalid config entries: " + "; ".join(problems),
@@ -982,6 +1087,19 @@ def selftest() -> int:
     check("chord 1 bytes", chord1.hex(), "1d2eae9d")
     check("profile is 4096 bytes", len(got_profile), codec.PROFILE_SIZE)
     check("profile zero padded", set(got_profile[39:]), {0})
+
+    # 9. OMEN logo key: shortcut list helpers never clobber other entries.
+    others = ["/org/example/a/", "/org/example/b/"]
+    check("omen path appended once",
+          omen_key.ensure_omen_path(others), others + [omen_key.OMEN_PATH])
+    check("omen path idempotent",
+          omen_key.ensure_omen_path(others + [omen_key.OMEN_PATH]),
+          others + [omen_key.OMEN_PATH])
+    check("omen path removal keeps others",
+          omen_key.remove_omen_path(others + [omen_key.OMEN_PATH]), others)
+    check("omen payload binds XF86Launch2",
+          omen_key.binding_payload("OMEN Key", "omen-macro"),
+          {"name": "OMEN Key", "command": "omen-macro", "binding": "XF86Launch2"})
 
     print()
     if failures:
