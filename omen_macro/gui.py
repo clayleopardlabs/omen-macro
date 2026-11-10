@@ -325,6 +325,7 @@ class MacroWindow(Gtk.ApplicationWindow):
 
         self.slots: dict[str, list[list[str]]] = {}
         self.rows: dict[str, dict[str, Gtk.Widget]] = {}
+        self.omen_command: str = omen_key.OMEN_DEFAULT_COMMAND
         self.recording: Recording | None = None
         self.recording_slot: str | None = None
         self._config_line = f"config: {config_path()}"
@@ -405,10 +406,10 @@ class MacroWindow(Gtk.ApplicationWindow):
         main_list.set_show_separators(True)
         for slot in codec.PRIMARY_SLOTS:
             self._add_row(main_list, slot)
+        self._add_omen_row(main_list)
         content.append(main_list)
 
         content.append(self._build_spacing_row())
-        content.append(self._build_omen_key())
         content.append(self._build_advanced())
         return content
 
@@ -494,77 +495,128 @@ class MacroWindow(Gtk.ApplicationWindow):
         expander.set_child(inner)
         return expander
 
-    def _build_omen_key(self) -> Gtk.Widget:
-        frame = Gtk.Frame(label="OMEN key (logo button)")
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    def _add_omen_row(self, listbox: Gtk.ListBox) -> None:
+        """Append the OMEN logo-key row, same layout as the P-key rows.
+
+        The logo key is not an EC slot (it always sends XF86Launch2), so
+        instead of recording a macro, Set opens a dialog for the command the
+        key should run. Clear removes the GNOME shortcut.
+        """
+        row = Gtk.ListBoxRow()
+        row.add_css_class("macro-row")
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         for side in ("top", "bottom", "start", "end"):
-            getattr(box, f"set_margin_{side}")(6)
+            getattr(box, f"set_margin_{side}")(4)
 
-        hint = Gtk.Label(xalign=0)
-        hint.set_wrap(True)
-        hint.add_css_class("dim-label")
-        hint.set_text(
-            "The logo key is not an EC macro: it always sends XF86Launch2 "
-            "(KEY_PROG2). Type the command it should run, then Bind it. "
-            "The GUI owns one GNOME custom shortcut for this and leaves "
-            "your other shortcuts alone."
-        )
-        box.append(hint)
+        name_label = Gtk.Label(label="OMEN", xalign=0)
+        name_label.add_css_class("macro-key")
+        name_label.set_size_request(96, -1)
 
-        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.omen_entry = Gtk.Entry()
-        self.omen_entry.set_hexpand(True)
-        self.omen_entry.set_text(omen_key.OMEN_DEFAULT_COMMAND)
-        self.omen_entry.set_tooltip_text(
-            "Command run when the OMEN logo key is pressed"
-        )
-        bind_btn = Gtk.Button(label="Bind OMEN key")
-        bind_btn.set_tooltip_text(
-            "Create or update the GNOME shortcut: XF86Launch2 runs this command"
-        )
-        bind_btn.connect("clicked", self._on_omen_bind_clicked)
-        remove_btn = Gtk.Button(label="Remove")
-        remove_btn.set_tooltip_text("Remove the OMEN key shortcut")
-        remove_btn.connect("clicked", self._on_omen_remove_clicked)
-        row.append(self.omen_entry)
-        row.append(bind_btn)
-        row.append(remove_btn)
-        box.append(row)
+        summary = Gtk.Label(label="no binding", xalign=0)
+        summary.set_hexpand(True)
+        summary.set_ellipsize(Pango.EllipsizeMode.END)
 
-        self.omen_status = Gtk.Label(label="", xalign=0)
-        self.omen_status.set_wrap(True)
-        self.omen_status.add_css_class("dim-label")
-        self.omen_status.set_selectable(True)
-        box.append(self.omen_status)
+        set_btn = Gtk.Button(label="Set")
+        set_btn.set_tooltip_text("Set the command the OMEN logo key runs")
+        set_btn.connect("clicked", self._on_omen_set_clicked)
 
-        frame.set_child(box)
-        return frame
+        clear_btn = Gtk.Button(label="Clear")
+        clear_btn.set_tooltip_text("Remove the OMEN key shortcut")
+        clear_btn.connect("clicked", self._on_omen_remove_clicked)
+
+        for widget in (name_label, summary, set_btn, clear_btn):
+            box.append(widget)
+        row.set_child(box)
+        listbox.append(row)
+        self.omen_row = {
+            "row": row,
+            "summary": summary,
+            "set": set_btn,
+            "clear": clear_btn,
+        }
 
     def _refresh_omen_status(self) -> None:
+        row = getattr(self, "omen_row", None)
+        if row is None:
+            return
         try:
             data = omen_key.get_omen_binding()
             paths = omen_key.get_custom_paths()
         except OSError as exc:
-            self.omen_status.set_text(f"OMEN key: could not read shortcuts ({exc})")
+            text = f"could not read shortcuts ({exc})"
+            row["summary"].set_text(text)
+            row["summary"].set_tooltip_text(text)
             return
         if omen_key.OMEN_PATH not in paths or not data or not data.get("command"):
-            self.omen_status.set_text("OMEN key: no binding (pressing it does nothing)")
-            return
-        self.omen_status.set_text(omen_key.describe_binding(data))
+            text = "no binding (pressing it does nothing)"
+        else:
+            text = omen_key.describe_binding(data)
+        row["summary"].set_text(text)
+        row["summary"].set_tooltip_text(text)
 
-    def _on_omen_bind_clicked(self, _button) -> None:
-        command = self.omen_entry.get_text().strip()
-        if not command:
-            self._set_banner("OMEN key: type a command first.", "banner-error")
-            return
-        try:
-            omen_key.set_omen_key(command)
-        except (OSError, ValueError) as exc:
-            self._set_banner(f"OMEN key: could not save the shortcut ({exc})", "banner-error")
-            return
-        self._set_banner("", "")
-        self._refresh_omen_status()
-        self._set_status(f"OMEN key now runs {command!r} (saved to GNOME shortcuts).")
+    def _on_omen_set_clicked(self, _button) -> None:
+        dialog = Gtk.Window(transient_for=self, modal=True, title="OMEN key command")
+        dialog.set_default_size(420, -1)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{side}")(12)
+
+        label = Gtk.Label(xalign=0)
+        label.set_wrap(True)
+        label.set_text(
+            "Command run when the OMEN logo key is pressed (it sends XF86Launch2)."
+        )
+        box.append(label)
+
+        entry = Gtk.Entry()
+        entry.set_hexpand(True)
+        current = (self.omen_command or "").strip()
+        if not current:
+            try:
+                data = omen_key.get_omen_binding()
+                if data and data.get("command"):
+                    current = data["command"]
+            except OSError:
+                pass
+        entry.set_text(current or omen_key.OMEN_DEFAULT_COMMAND)
+        box.append(entry)
+
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        buttons.set_halign(Gtk.Align.END)
+        cancel = Gtk.Button(label="Cancel")
+        ok = Gtk.Button(label="Bind")
+        ok.add_css_class("suggested-action")
+        buttons.append(cancel)
+        buttons.append(ok)
+        box.append(buttons)
+        dialog.set_child(box)
+
+        def done(bind: bool) -> None:
+            if bind:
+                command = entry.get_text().strip()
+                if not command:
+                    self._set_banner("OMEN key: type a command first.", "banner-error")
+                    return
+                try:
+                    omen_key.set_omen_key(command)
+                except (OSError, ValueError) as exc:
+                    self._set_banner(
+                        f"OMEN key: could not save the shortcut ({exc})", "banner-error"
+                    )
+                    return
+                self.omen_command = command
+                self._set_banner("", "")
+                self._refresh_omen_status()
+                self._set_status(
+                    f"OMEN key now runs {command!r} (saved to GNOME shortcuts)."
+                )
+            dialog.close()
+
+        cancel.connect("clicked", lambda _b: done(False))
+        ok.connect("clicked", lambda _b: done(True))
+        entry.connect("activate", lambda _e: done(True))
+        dialog.present()
 
     def _on_omen_remove_clicked(self, _button) -> None:
         try:
@@ -762,11 +814,9 @@ class MacroWindow(Gtk.ApplicationWindow):
             if chords
         }
         cfg: dict = {"spacing_ms": int(self.spacing.get_value()), "slots": slots}
-        entry = getattr(self, "omen_entry", None)
-        if entry is not None:
-            command = entry.get_text().strip()
-            if command:
-                cfg["omen_key"] = {"command": command, "name": omen_key.OMEN_DEFAULT_NAME}
+        command = (getattr(self, "omen_command", "") or "").strip()
+        if command:
+            cfg["omen_key"] = {"command": command, "name": omen_key.OMEN_DEFAULT_NAME}
         return cfg
 
     @staticmethod
@@ -812,14 +862,13 @@ class MacroWindow(Gtk.ApplicationWindow):
         raw_omen = cfg.get("omen_key")
         if isinstance(raw_omen, dict) and isinstance(raw_omen.get("command"), str):
             command = raw_omen["command"].strip()
-            if command and hasattr(self, "omen_entry"):
-                self.omen_entry.set_text(command)
+            if command:
+                self.omen_command = command
         elif raw_omen is not None:
             problems.append("omen_key is not an object with a command string")
 
         self._refresh_all()
-        if hasattr(self, "omen_status"):
-            self._refresh_omen_status()
+        self._refresh_omen_status()
         if problems:
             self._set_banner(
                 "Ignored invalid config entries: " + "; ".join(problems),
