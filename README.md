@@ -95,6 +95,8 @@ resident during the first upload) and check `omen-macro-apply --status`.
 omen-macro # GUI (also "OMEN Macro Keys" in the app grid)
 ```
 
+![OMEN Macro Keys GUI](screenshot.webp)
+
 Click **Record** on a key, type the sequence, press **Stop**, then **Apply to
 EC**. Recording captures *key order only*; the "Spacing between key presses"
 spinbox sets the delay inserted between keystrokes when the EC replays them.
