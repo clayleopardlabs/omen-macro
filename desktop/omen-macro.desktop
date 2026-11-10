@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=OMEN Macro Keys
+GenericName=Macro Key Configuration
+Comment=Configure the P1-P6 macro keys on an HP OMEN laptop
+Exec=omen-macro
+Icon=input-keyboard
+Terminal=false
+Categories=System;Settings;HardwareSettings;
+Keywords=omen;macro;keyboard;P1;P6;

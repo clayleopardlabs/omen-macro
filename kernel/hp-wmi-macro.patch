@@ -1,0 +1,175 @@
+--- a/hp-wmi.c
++++ b/hp-wmi.c
+@@ -18,6 +18,7 @@
+ #include <linux/compiler_attributes.h>
+ #include <linux/dmi.h>
+ #include <linux/fixp-arith.h>
++#include <linux/fs.h>
+ #include <linux/hwmon.h>
+ #include <linux/init.h>
+ #include <linux/input.h>
+@@ -34,6 +35,7 @@
+ #include <linux/rfkill.h>
+ #include <linux/slab.h>
+ #include <linux/string.h>
++#include <linux/sysfs.h>
+ #include <linux/types.h>
+ #include <linux/version.h>
+ #include <linux/workqueue.h>
+@@ -2921,6 +2923,124 @@
+ 	return 0;
+ }
+ 
++/*
++ * OMEN macro keys (P1..P6 on the left edge of the keyboard).
++ *
++ * Those keys are not wired to the keyboard controller: the embedded
++ * controller holds a 4096 byte table of PS/2 scan-code-set-1 sequences and
++ * only starts generating keystrokes for them once that table has been written
++ * and the macro engine enabled.  HP's Windows "OMEN Gaming Hub" does this via
++ * WMI query 15 (upload) and query 23 (enable), both with command HPWMI_GM
++ * (0x20008).  Table layout, reverse engineered by Lan Tian (2022) and
++ * implemented in xddxdd/hp-omen-linux-module:
++ *
++ *   slot  0..5   P1..P6           slot 18..23  Shift+P1..P6
++ *   slot  6..11  Ctrl+P1..P6      slot 24..29  Fn+P1..P6
++ *   slot 12..17  Alt+P1..P6
++ *
++ * Each entry is [len][scan-code bytes...] where len counts itself, an unused
++ * slot is the single byte 0x01, release codes are make|0x80, 0xFF+ms is a
++ * delay and extended keys carry a 0xE0 prefix.  A single extra 0x01 byte
++ * terminates the list.  The table is built in userspace (omen_macro.codec);
++ * this driver only transports it.
++ */
++#define HPWMI_MACRO_PROFILE_SET		15
++#define HPWMI_MACRO_MODE_SET		23
++#define HPWMI_MACRO_PROFILE_SIZE	4096
++
++static u8 *hp_macro_buffer;
++static int hp_macro_write_ret = -1;
++static int hp_macro_mode_ret = -1;
++static bool hp_macro_applied;
++
++static int hp_macro_apply(void)
++{
++	u32 enable = 1;
++	int ret;
++
++	if (!hp_macro_buffer)
++		return -ENODEV;
++
++	hp_macro_applied = false;
++
++	ret = hp_wmi_perform_query(HPWMI_MACRO_PROFILE_SET, HPWMI_GM,
++				   hp_macro_buffer, HPWMI_MACRO_PROFILE_SIZE, 0);
++	hp_macro_write_ret = ret;
++	if (ret) {
++		pr_warn("macro: profile upload failed (0x%x)\n", ret);
++		return -EIO;
++	}
++
++	ret = hp_wmi_perform_query(HPWMI_MACRO_MODE_SET, HPWMI_GM,
++				   &enable, sizeof(enable), 0);
++	hp_macro_mode_ret = ret;
++	if (ret) {
++		pr_warn("macro: enabling the macro engine failed (0x%x)\n", ret);
++		return -EIO;
++	}
++
++	hp_macro_applied = true;
++	pr_info("macro: profile uploaded and engine enabled\n");
++	return 0;
++}
++
++static ssize_t hp_macro_profile_write(struct file *file, struct kobject *kobj,
++				      const struct bin_attribute *attr, char *buf,
++				      loff_t off, size_t count)
++{
++	if (off || count != HPWMI_MACRO_PROFILE_SIZE)
++		return -EINVAL;
++
++	if (!hp_macro_buffer)
++		return -ENODEV;
++
++	memcpy(hp_macro_buffer, buf, HPWMI_MACRO_PROFILE_SIZE);
++
++	if (hp_macro_apply())
++		return -EIO;
++
++	return count;
++}
++
++static struct bin_attribute hp_macro_profile_attr = {
++	.attr = { .name = "macro_profile", .mode = 0200 },
++	.size = HPWMI_MACRO_PROFILE_SIZE,
++	.write = hp_macro_profile_write,
++};
++
++static ssize_t macro_status_show(struct device *dev,
++				 struct device_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf,
++			  "profile_write_ret=%d\nmode_set_ret=%d\napplied=%d\n",
++			  hp_macro_write_ret, hp_macro_mode_ret,
++			  hp_macro_applied ? 1 : 0);
++}
++static DEVICE_ATTR_RO(macro_status);
++
++static void hp_macro_setup(struct platform_device *dev)
++{
++	hp_macro_buffer = devm_kzalloc(&dev->dev, HPWMI_MACRO_PROFILE_SIZE,
++				       GFP_KERNEL);
++	if (!hp_macro_buffer) {
++		pr_warn("macro: could not allocate the profile buffer\n");
++		return;
++	}
++
++	if (device_create_bin_file(&dev->dev, &hp_macro_profile_attr))
++		pr_warn("macro: could not create macro_profile\n");
++	if (device_create_file(&dev->dev, &dev_attr_macro_status))
++		pr_warn("macro: could not create macro_status\n");
++
++	pr_info("macro: EC interface ready, waiting for a profile\n");
++}
++
++static void hp_macro_teardown(struct platform_device *dev)
++{
++	device_remove_bin_file(&dev->dev, &hp_macro_profile_attr);
++	device_remove_file(&dev->dev, &dev_attr_macro_status);
++}
++
+ static int hp_wmi_hwmon_init(void);
+ 
+ static int __init hp_wmi_bios_setup(struct platform_device *device)
+@@ -2949,6 +3069,8 @@
+ 	if (err < 0)
+ 		pr_warn("Failed to set up thermal profile (%d), fan control still available\n", err);
+ 
++	hp_macro_setup(device);
++
+ 	return 0;
+ }
+ 
+@@ -2979,6 +3101,8 @@
+ 	if (priv)
+ 		cancel_delayed_work_sync(&priv->keep_alive_dwork);
+ 
++	hp_macro_teardown(device);
++
+ 	if (platform_profile_support) {
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 14, 0)
+ 		platform_profile_remove();
+@@ -3014,6 +3138,13 @@
+ 				  hp_wmi_get_sw_state(HPWMI_WWAN),
+ 				  hp_wmi_get_hw_state(HPWMI_WWAN));
+ 
++	/*
++	 * Some firmware drops the EC macro table across suspend; re-upload it
++	 * rather than making the user notice after a lid close.
++	 */
++	if (hp_macro_applied)
++		hp_macro_apply();
++
+ 	return 0;
+ }
+ 

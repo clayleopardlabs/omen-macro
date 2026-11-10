@@ -1,0 +1,27 @@
+[Unit]
+Description=Upload the OMEN macro-key profile to the embedded controller
+Documentation=file:///usr/local/lib/omen-macro/README.md
+# Deliberately NOT ordered after multi-user.target.  On this machine userspace
+# takes ~2 minutes, and the EC needs the table as soon as the driver is up, not
+# after the login screen.  Default dependencies still put us after
+# sysinit/basic.target and before shutdown.target.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The WMI platform device can appear before udev has finished coldplug; load
+# the driver ourselves, then wait for the attribute it creates in probe.
+ExecStartPre=-/sbin/modprobe hp_wmi
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do [ -e /sys/devices/platform/hp-wmi/macro_profile ] && exit 0; sleep 0.25; done; echo "hp-wmi macro_profile never appeared" >&2; exit 1'
+ExecStart=/usr/local/bin/omen-macro-apply --config /etc/omen-macro/profile.json
+# udev can see the platform device before the driver creates the attributes, so
+# grant the omen-hw group write access here too instead of relying on the udev
+# rule alone.
+ExecStartPost=-/bin/sh -c 'chgrp omen-hw /sys/devices/platform/hp-wmi/macro_profile /sys/devices/platform/hp-wmi/macro_status 2>/dev/null; chmod 0220 /sys/devices/platform/hp-wmi/macro_profile 2>/dev/null; chmod 0444 /sys/devices/platform/hp-wmi/macro_status 2>/dev/null'
+# 3/4/5 = interface missing / permission denied / EC rejected the table.  None
+# of them should turn boot into "degraded"; the reason lands in the journal.
+SuccessExitStatus=3 4 5
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target
