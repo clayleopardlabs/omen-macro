@@ -111,6 +111,12 @@ saves the current profile and sends it to the keyboard immediately** - there
 is no separate save step, and the boot service re-applies the active profile
 after a restart.
 
+Some shortcuts cannot be recorded live: the desktop grabs them first (the
+classic case is Ctrl+Alt+T, which opens a terminal and steals focus before
+the T reaches the window). For those, use the **Keys** button on the row to
+tick modifiers and pick the key by hand; what you compose is exactly what the
+EC will replay.
+
 ### Profiles
 
 The profile switcher sits at the top of the window. New creates a profile as

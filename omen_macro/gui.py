@@ -157,6 +157,25 @@ def canonical_name(name: str) -> str:
         raise
 
 
+KEY_CHOICES = sorted(codec.SCANCODES.keys(), key=str.lower)
+
+
+def build_chord(modifiers: list[str], key: str) -> list[str]:
+    """Compose one chord from modifier names plus a main key, validated.
+
+    Raises codec.MacroError for an empty key, a duplicate of a held modifier,
+    or anything the EC cannot replay. Callers pass modifiers in press order
+    (Ctrl, Alt, Shift, Super). Pure: the selftest and the Keys dialog share it.
+    """
+    mods = [canonical_name(m) for m in modifiers]
+    main = canonical_name((key or "").strip()) if (key or "").strip() else ""
+    if not main:
+        raise codec.MacroError("pick a key for the chord")
+    if main in mods:
+        raise codec.MacroError(f"{main} is already held as a modifier")
+    return mods + [main]
+
+
 # --------------------------------------------------------------------------- #
 # Recording state machine - pure Python so it can be tested without a display
 # --------------------------------------------------------------------------- #
@@ -352,7 +371,7 @@ class MacroWindow(Gtk.ApplicationWindow):
 
     def _add_row(self, listbox: Gtk.ListBox, slot: str,
                  with_command: bool = False) -> None:
-        """Append one [name | summary | Record | Cmd? | Clear] row to ``listbox``."""
+        """Append one [name | summary | Record | Keys | Cmd? | Clear] row."""
         row = Gtk.ListBoxRow()
         row.add_css_class("macro-row")
 
@@ -372,7 +391,14 @@ class MacroWindow(Gtk.ApplicationWindow):
         record.set_tooltip_text(f"Record the keystrokes the EC replays for {slot}")
         record.connect("clicked", lambda _btn, s=slot: self._on_record_clicked(s))
 
-        widgets: list[Gtk.Widget] = [name_label, summary, record]
+        keys = Gtk.Button(label="Keys")
+        keys.set_tooltip_text(
+            f"Type {slot}'s keys in by hand (for shortcuts the system "
+            "grabs before recording can see them, like Ctrl+Alt+T)"
+        )
+        keys.connect("clicked", lambda _btn, s=slot: self._open_keys_dialog(s))
+
+        widgets: list[Gtk.Widget] = [name_label, summary, record, keys]
 
         cmd_btn = None
         if with_command:
@@ -1097,6 +1123,144 @@ class MacroWindow(Gtk.ApplicationWindow):
         entry.connect("activate", lambda _e: done(True))
         dialog.present()
 
+    def _open_keys_dialog(self, slot: str) -> None:
+        """Manually compose the chords for slot.
+
+        Live recording cannot capture shortcuts the desktop grabs itself
+        (Ctrl+Alt+T opens a terminal before our window ever sees the T), so
+        this dialog writes exactly what the EC should replay: tick the
+        modifiers, pick the key, Add chord. OK commits and persists.
+        """
+        self._finish_recording()
+        dialog = Gtk.Window(transient_for=self, modal=True, title=f"{slot} keys")
+        dialog.set_default_size(480, -1)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{side}")(12)
+
+        hint = Gtk.Label(xalign=0)
+        hint.set_wrap(True)
+        hint.add_css_class("dim-label")
+        hint.set_text(
+            "Tick the modifiers, pick the key, Add chord. Use this for "
+            "shortcuts the system grabs before recording sees them "
+            "(for example Ctrl+Alt+T, which opens a terminal)."
+        )
+        box.append(hint)
+
+        working: list[list[str]] = [list(c) for c in self.slots.get(slot, [])]
+        saved: list[list[str]] = [list(c) for c in working]
+
+        chords_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.append(chords_box)
+
+        def refresh_chords() -> None:
+            while True:
+                child = chords_box.get_first_child()
+                if child is None:
+                    break
+                chords_box.remove(child)
+            if not working:
+                empty = Gtk.Label(label="no chords yet", xalign=0)
+                empty.add_css_class("dim-label")
+                chords_box.append(empty)
+            for i, chord in enumerate(working):
+                row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+                text = Gtk.Label(label=codec.describe_chord(chord), xalign=0)
+                text.set_hexpand(True)
+                text.set_ellipsize(Pango.EllipsizeMode.END)
+                remove = Gtk.Button(label="Remove")
+                remove.connect(
+                    "clicked",
+                    lambda _b, idx=i: (working.pop(idx), refresh_chords()),
+                )
+                row.append(text)
+                row.append(remove)
+                chords_box.append(row)
+
+        refresh_chords()
+
+        add_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        mod_checks: dict[str, Gtk.CheckButton] = {}
+        for pretty, canonical in (
+            ("Ctrl", "Control_L"),
+            ("Alt", "Alt_L"),
+            ("Shift", "Shift_L"),
+            ("Super", "Super_L"),
+        ):
+            check = Gtk.CheckButton(label=pretty)
+            mod_checks[canonical] = check
+            add_row.append(check)
+        key_combo = Gtk.ComboBoxText.new_with_entry()
+        for name in KEY_CHOICES:
+            key_combo.append_text(name)
+        key_combo.set_active(-1)
+        add_row.append(key_combo)
+        add_btn = Gtk.Button(label="Add chord")
+        add_row.append(add_btn)
+        box.append(add_row)
+
+        def key_text() -> str:
+            entry = key_combo.get_child()
+            return entry.get_text() if isinstance(entry, Gtk.Entry) else ""
+
+        def on_add(_btn) -> None:
+            mods = [m for m, check in mod_checks.items() if check.get_active()]
+            try:
+                chord = build_chord(mods, key_text())
+            except codec.MacroError as exc:
+                self._set_banner(f"{slot}: {exc}", "banner-error")
+                return
+            self._set_banner("", "")
+            working.append(chord)
+            for check in mod_checks.values():
+                check.set_active(False)
+            entry = key_combo.get_child()
+            if isinstance(entry, Gtk.Entry):
+                entry.set_text("")
+            refresh_chords()
+
+        add_btn.connect("clicked", on_add)
+
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        buttons.set_halign(Gtk.Align.END)
+        reset = Gtk.Button(label="Reset")
+        reset.set_tooltip_text("Throw away dialog edits, back to the saved chords")
+        cancel = Gtk.Button(label="Cancel")
+        ok = Gtk.Button(label="OK")
+        ok.add_css_class("suggested-action")
+        buttons.append(reset)
+        buttons.append(cancel)
+        buttons.append(ok)
+        box.append(buttons)
+        dialog.set_child(box)
+
+        def done(confirmed: bool) -> None:
+            if confirmed:
+                old = self.slots.get(slot)
+                if working:
+                    self.slots[slot] = [list(c) for c in working]
+                    note = f"{slot} = {codec.describe_entry(working)}."
+                else:
+                    self.slots.pop(slot, None)
+                    note = f"{slot} cleared."
+                if not self._persist(note):
+                    if old is None:
+                        self.slots.pop(slot, None)
+                    else:
+                        self.slots[slot] = old
+                    return
+            dialog.close()
+
+        reset.connect(
+            "clicked",
+            lambda _b: (working.clear(), working.extend([list(c) for c in saved]),
+                        refresh_chords(), self._set_banner("", "")),
+        )
+        cancel.connect("clicked", lambda _b: done(False))
+        ok.connect("clicked", lambda _b: done(True))
+        dialog.present()
+
     def _on_cmd_clicked(self, slot: str) -> None:
         self._finish_recording()
         self._open_command_dialog(slot)
@@ -1204,10 +1368,19 @@ class MacroWindow(Gtk.ApplicationWindow):
 
     def _on_active_changed(self, window: Gtk.Window, _param) -> None:
         # Key releases never arrive after focus loss, so close the open chord.
+        # This is also what happens when the shortcut being recorded fires
+        # system-wide (Ctrl+Alt+T opens a terminal and takes focus): the rest
+        # of the chord never reaches us, so point at the manual editor.
         if window.props.is_active or self.recording is None:
             return
         self.recording.drop_held()
         self._sync_recording_ui()
+        self._set_banner(
+            f"{self.recording_slot}: focus left the window. Shortcuts the "
+            "system grabs itself (like Ctrl+Alt+T opening a terminal) cannot "
+            "be recorded live - use the Keys button to type them in.",
+            "banner-warning",
+        )
 
     # -- recording ---------------------------------------------------------
     def _on_record_clicked(self, slot: str) -> None:
@@ -1686,6 +1859,21 @@ def selftest() -> int:
                {"match": "firefox", "profile": "B"}]),
           "A")
     check("auto match none", auto_switch.match_app("a", "b", []), None)
+
+    # 12. Manual chord builder: the Ctrl+Alt+T case from the bug report.
+    check("manual chord Ctrl+Alt+T",
+          build_chord(["Control_L", "Alt_L"], "t"),
+          ["Control_L", "Alt_L", "t"])
+    check("manual chord single key", build_chord([], "F5"), ["F5"])
+    for bad_mods, bad_key in (([], ""), ([], "F13"),
+                              (["Control_L"], "Control_L")):
+        try:
+            build_chord(bad_mods, bad_key)
+            check(f"manual chord rejects {bad_mods!r}/{bad_key!r}",
+                  "no error", "MacroError")
+        except codec.MacroError:
+            check(f"manual chord rejects {bad_mods!r}/{bad_key!r}",
+                  "MacroError", "MacroError")
 
     print()
     if failures:
