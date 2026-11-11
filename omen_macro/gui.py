@@ -30,10 +30,12 @@ Files
     profile written to  /sys/devices/platform/hp-wmi/macro_profile
                         (override the directory with OMEN_MACRO_SYSFS)
     status read from    /sys/devices/platform/hp-wmi/macro_status
-    config saved to     /etc/omen-macro/profile.json (the file apply.py and the
-                        boot unit read); falls back to ~/.config/omen-macro/
-                        profile.json only while /etc/omen-macro does not exist.
-                        OMEN_MACRO_CONFIG overrides the full file path.
+    profiles live in    <root>/profiles/<name>.json, active pointer in
+                        <root>/active-profile (root is /etc/omen-macro, or
+                        ~/.config/omen-macro before install; OMEN_MACRO_ROOT
+                        overrides). Every edit saves the current profile and
+                        sends it to the EC immediately - there is no separate
+                        save step.
 
     The OMEN logo key is not an EC slot: it always reports KEY_PROG2
     (XF86Launch2). Any key (OMEN or P1..P6) can instead run a command through
@@ -43,8 +45,7 @@ Files
 
 from __future__ import annotations
 
-import json
-import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -54,30 +55,33 @@ gi.require_version("Gdk", "4.0")
 gi.require_version("Gtk", "4.0")
 gi.require_version("Pango", "1.0")
 
-from gi.repository import Gdk, Gtk, Pango  # noqa: E402
+from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
 
 # Allow both "python3 -m omen_macro.gui" and "python3 omen_macro/gui.py".
 _PKG_PARENT = Path(__file__).resolve().parent.parent
 if str(_PKG_PARENT) not in sys.path:
     sys.path.insert(0, str(_PKG_PARENT))
 
+from omen_macro import auto_switch  # noqa: E402
 from omen_macro import codec  # noqa: E402
 from omen_macro import omen_key  # noqa: E402
+from omen_macro import profiles  # noqa: E402
+from omen_macro.ec import (  # noqa: E402
+    DEFAULT_SYSFS,
+    PROFILE_ATTR,
+    STATUS_ATTR,
+    SYSFS_ENV,
+    read_status,
+    sysfs_dir,
+    upload_config,
+    write_profile,
+)
 
 APP_ID = "io.github.omenmacro.Gui"
 WINDOW_TITLE = "OMEN Macro Keys"
 
-DEFAULT_SYSFS = "/sys/devices/platform/hp-wmi"
-PROFILE_ATTR = "macro_profile"
-STATUS_ATTR = "macro_status"
-SYSFS_ENV = "OMEN_MACRO_SYSFS"
-
 DEFAULT_SPACING_MS = 20
 MAX_SPACING_MS = 2040  # codec.build_profile() ceiling
-
-DEFAULT_CONFIG = Path("/etc/omen-macro/profile.json")
-FALLBACK_CONFIG = Path.home() / ".config" / "omen-macro" / "profile.json"
-CONFIG_ENV = "OMEN_MACRO_CONFIG"
 
 MSG_NO_HW = "hardware interface not found - run install.sh"
 MSG_NO_PERM = "permission denied - run install.sh to grant omen-hw write access"
@@ -87,16 +91,15 @@ OMEN Macro Keys - configure P1..P6 on an HP OMEN laptop
 
 Usage:
   python3 -m omen_macro.gui              launch the GTK4 window
-  python3 -m omen_macro.gui --selftest   run the headless recording self-check
+  python3 -m omen_macro.gui --selftest   run the headless self-check
   python3 -m omen_macro.gui --help       show this text
 
 Environment:
   OMEN_MACRO_SYSFS   directory holding macro_profile / macro_status
                      (default /sys/devices/platform/hp-wmi)
-  OMEN_MACRO_CONFIG  full path of the saved profile.json
-                     (default /etc/omen-macro/profile.json, or
-                     ~/.config/omen-macro/profile.json while /etc/omen-macro
-                     does not exist)
+  OMEN_MACRO_ROOT    config root holding profiles/ and active-profile
+                     (default /etc/omen-macro, or ~/.config/omen-macro
+                     while /etc/omen-macro does not exist)
 """
 
 CSS = """
@@ -127,12 +130,6 @@ CSS = """
 # --------------------------------------------------------------------------- #
 # sysfs / config helpers (no GTK needed - reused by the selftest)
 # --------------------------------------------------------------------------- #
-def sysfs_dir() -> Path:
-    """Directory holding macro_profile / macro_status, honouring OMEN_MACRO_SYSFS."""
-    override = os.environ.get(SYSFS_ENV, "").strip()
-    return Path(override) if override else Path(DEFAULT_SYSFS)
-
-
 def key_name(keyval: int) -> str:
     """GDK keyval -> the key names codec understands ("a", "Control_L", "KP_1").
 
@@ -158,77 +155,6 @@ def canonical_name(name: str) -> str:
         if len(name) == 1 and name.isascii() and name.isupper():
             return codec.normalise(name.lower())
         raise
-
-
-def write_profile(profile: bytes, sysfs: Path | None = None) -> int:
-    """Write the whole table to macro_profile with a single write() syscall.
-
-    The kernel attribute parses the buffer it is handed, so the 4096 bytes must
-    arrive in one call - hence buffering=0 and a length check.
-    """
-    if len(profile) != codec.PROFILE_SIZE:
-        raise ValueError(
-            f"profile must be {codec.PROFILE_SIZE} bytes, got {len(profile)}"
-        )
-    path = (sysfs or sysfs_dir()) / PROFILE_ATTR
-    with open(path, "wb", buffering=0) as handle:
-        written = handle.write(profile)
-    if written != len(profile):
-        raise OSError(f"short write to {path}: {written} of {len(profile)} bytes")
-    return written
-
-
-def read_status(sysfs: Path | None = None) -> str:
-    """Read macro_status; failures are reported as text, never raised."""
-    path = (sysfs or sysfs_dir()) / STATUS_ATTR
-    try:
-        return path.read_text().strip()
-    except OSError as exc:
-        return f"(cannot read {path}: {exc})"
-
-
-def config_path() -> Path:
-    """Where Save/Load keeps profile.json.
-
-    1. $OMEN_MACRO_CONFIG when set - a full file path, for testing or a
-       non-standard install.
-    2. /etc/omen-macro/profile.json - install.sh creates that directory
-       group-writable by omen-hw, and both apply.py and the boot unit read it.
-    3. ~/.config/omen-macro/profile.json, but only while /etc/omen-macro does
-       not exist at all (running from a dev checkout before install.sh).
-
-    A PermissionError is deliberately *not* a fallback case: it means the
-    install is broken, so the caller shows the real error instead of silently
-    saving somewhere else.
-    """
-    override = os.environ.get(CONFIG_ENV, "").strip()
-    if override:
-        return Path(override).expanduser()
-    if DEFAULT_CONFIG.parent.is_dir():
-        return DEFAULT_CONFIG
-    return FALLBACK_CONFIG
-
-
-def load_config(path: Path | None = None) -> tuple[dict, bool]:
-    """Return (config, found).  Raises OSError/ValueError if the file is unusable."""
-    path = path or config_path()
-    if not path.is_file():
-        return {"spacing_ms": DEFAULT_SPACING_MS, "slots": {}}, False
-    cfg = json.loads(path.read_text())
-    if not isinstance(cfg, dict):
-        raise ValueError("top level JSON value is not an object")
-    return cfg, True
-
-
-def save_config(cfg: dict, path: Path | None = None) -> Path:
-    """Write {"spacing_ms": int, "slots": {name: [[key, ...], ...]}} as JSON.
-
-    Parent directories are not created here: install.sh owns /etc/omen-macro and
-    only the ~/.config fallback needs mkdir, which the window does explicitly.
-    """
-    path = path or config_path()
-    path.write_text(json.dumps(cfg, indent=2) + "\n")
-    return path
 
 
 # --------------------------------------------------------------------------- #
@@ -318,18 +244,25 @@ class Recording:
 # GTK4 window
 # --------------------------------------------------------------------------- #
 class MacroWindow(Gtk.ApplicationWindow):
-    """One row per slot, a spacing spin button, apply/save controls and status."""
+    """Profile switcher, one row per slot, auto-save/apply and status."""
 
     def __init__(self, app: Gtk.Application) -> None:
         super().__init__(application=app, title=WINDOW_TITLE)
-        self.set_default_size(960, 720)
+        self.set_default_size(960, 760)
 
         self.slots: dict[str, list[list[str]]] = {}
         self.rows: dict[str, dict[str, Gtk.Widget]] = {}
         self.commands: dict[str, str] = {}
         self.recording: Recording | None = None
         self.recording_slot: str | None = None
-        self._config_line = f"config: {config_path()}"
+        self._root = profiles.config_root()
+        self._profile_name = ""
+        self._loading = False
+        self._combo_quiet = False
+        self._spacing_timer = 0
+        self._auto_quiet = False
+        self._auto_rules: list[dict] = []
+        self._auto_fallback: str | None = None
 
         self._build_ui()
         self._add_key_controller()
@@ -337,13 +270,14 @@ class MacroWindow(Gtk.ApplicationWindow):
             self.connect("notify::is-active", self._on_active_changed)
 
         self._refresh_all()
-        self._load_config()
+        self._load_store()
         self._refresh_omen_status()
+        self._refresh_auto_status()
         self._set_status(
             "\n".join(
                 [
                     self._device_line(),
-                    self._config_line,
+                    self._profile_line(),
                     "Nothing has been applied to the EC yet.",
                 ]
             )
@@ -388,6 +322,7 @@ class MacroWindow(Gtk.ApplicationWindow):
             "Recording keeps key order only; keys held together count as one chord."
         )
         content.append(subtitle)
+        content.append(self._build_profile_row())
 
         warning = Gtk.Label(xalign=0)
         warning.set_wrap(True)
@@ -412,6 +347,7 @@ class MacroWindow(Gtk.ApplicationWindow):
 
         content.append(self._build_spacing_row())
         content.append(self._build_advanced())
+        content.append(self._build_auto_section())
         return content
 
     def _add_row(self, listbox: Gtk.ListBox, slot: str,
@@ -482,12 +418,25 @@ class MacroWindow(Gtk.ApplicationWindow):
         self.spacing.set_value(DEFAULT_SPACING_MS)
         self.spacing.set_tooltip_text(
             "Delay the EC inserts between chords when it replays the macro "
-            f"(0-{MAX_SPACING_MS} ms)."
+            f"(0-{MAX_SPACING_MS} ms). Saves and applies as you change it."
         )
+        self.spacing.connect("value-changed", self._on_spacing_changed)
 
         box.append(label)
         box.append(self.spacing)
         return box
+
+    def _on_spacing_changed(self, _spin) -> None:
+        if self._loading:
+            return
+        if self._spacing_timer:
+            GLib.source_remove(self._spacing_timer)
+        self._spacing_timer = GLib.timeout_add(500, self._on_spacing_settled)
+
+    def _on_spacing_settled(self) -> bool:
+        self._spacing_timer = 0
+        self._persist()
+        return False
 
     def _build_advanced(self) -> Gtk.Widget:
         expander = Gtk.Expander(label="Advanced: Ctrl / Alt / Shift / Fn + P1-P6")
@@ -514,6 +463,495 @@ class MacroWindow(Gtk.ApplicationWindow):
 
         expander.set_child(inner)
         return expander
+
+    # -- profiles ----------------------------------------------------------
+    def _build_profile_row(self) -> Gtk.Widget:
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+
+        label = Gtk.Label(label="Profile:", xalign=0)
+        box.append(label)
+
+        self.profile_combo = Gtk.ComboBoxText()
+        self.profile_combo.set_hexpand(True)
+        self.profile_combo.set_tooltip_text(
+            "Switching profiles applies that profile immediately."
+        )
+        self.profile_combo.connect("changed", self._on_profile_selected)
+        box.append(self.profile_combo)
+
+        new_btn = Gtk.Button(label="New")
+        new_btn.set_tooltip_text("Create a profile as a copy of the current one")
+        new_btn.connect("clicked", self._on_profile_new)
+        rename_btn = Gtk.Button(label="Rename")
+        rename_btn.set_tooltip_text("Rename the current profile")
+        rename_btn.connect("clicked", self._on_profile_rename)
+        delete_btn = Gtk.Button(label="Delete")
+        delete_btn.set_tooltip_text("Delete the current profile")
+        delete_btn.connect("clicked", self._on_profile_delete)
+        for btn in (new_btn, rename_btn, delete_btn):
+            box.append(btn)
+        return box
+
+    def _profile_line(self) -> str:
+        return f"profile: {self._profile_name or '(none)'} ({self._root})"
+
+    def _refresh_profile_combo(self) -> None:
+        names = profiles.list_profiles(self._root)
+        self._combo_quiet = True
+        try:
+            self.profile_combo.remove_all()
+            for name in names:
+                self.profile_combo.append_text(name)
+            try:
+                idx = names.index(self._profile_name)
+            except ValueError:
+                idx = 0
+            self.profile_combo.set_active(idx)
+        finally:
+            self._combo_quiet = False
+
+    def _on_profile_selected(self, _combo) -> None:
+        if self._combo_quiet or self._loading:
+            return
+        name = self.profile_combo.get_active_text()
+        if name and name != self._profile_name:
+            self._switch_profile(name)
+
+    def _switch_profile(self, name: str) -> None:
+        try:
+            cfg = profiles.read_profile(self._root, name)
+        except (OSError, ValueError) as exc:
+            self._set_banner(
+                f"Could not read profile {name!r}: {exc}", "banner-error"
+            )
+            self._refresh_profile_combo()
+            return
+        try:
+            profiles.set_active(self._root, name)
+        except (OSError, ValueError) as exc:
+            self._set_banner(
+                f"Could not activate profile {name!r}: {exc}", "banner-error"
+            )
+            self._refresh_profile_combo()
+            return
+        self._profile_name = name
+        self._finish_recording()
+        self._loading = True
+        try:
+            self._apply_config_dict(cfg)
+        finally:
+            self._loading = False
+        self._refresh_profile_combo()
+        self._persist(f"Switched to profile {name}.")
+
+    def _profile_dialog(self, title: str, initial: str, ok_label: str,
+                        on_ok) -> None:
+        """Small modal text dialog; on_ok(text) runs on confirmation."""
+        dialog = Gtk.Window(transient_for=self, modal=True, title=title)
+        dialog.set_default_size(360, -1)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{side}")(12)
+        entry = Gtk.Entry()
+        entry.set_hexpand(True)
+        entry.set_text(initial)
+        box.append(entry)
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        buttons.set_halign(Gtk.Align.END)
+        cancel = Gtk.Button(label="Cancel")
+        ok = Gtk.Button(label=ok_label)
+        ok.add_css_class("suggested-action")
+        buttons.append(cancel)
+        buttons.append(ok)
+        box.append(buttons)
+        dialog.set_child(box)
+
+        def done(confirmed: bool) -> None:
+            if confirmed:
+                try:
+                    on_ok(entry.get_text())
+                except (OSError, ValueError) as exc:
+                    self._set_banner(f"{title}: {exc}", "banner-error")
+                    return
+            dialog.close()
+
+        cancel.connect("clicked", lambda _b: done(False))
+        ok.connect("clicked", lambda _b: done(True))
+        entry.connect("activate", lambda _e: done(True))
+        dialog.present()
+
+    def _on_profile_new(self, _button) -> None:
+        self._finish_recording()
+
+        def create(name: str) -> None:
+            clean = profiles.validate_name(name)
+            if clean in profiles.list_profiles(self._root):
+                raise ValueError(f"a profile named {clean!r} already exists")
+            profiles.save_profile(self._root, clean, self._config())
+            profiles.set_active(self._root, clean)
+            self._profile_name = clean
+            self._refresh_profile_combo()
+            self._refresh_auto_status()
+            self._persist(f"Created profile {clean}.")
+
+        self._profile_dialog("New profile", "", "Create", create)
+
+    def _on_profile_rename(self, _button) -> None:
+        self._finish_recording()
+        old = self._profile_name
+
+        def rename(name: str) -> None:
+            clean = profiles.validate_name(name)
+            profiles.rename_profile(self._root, old, clean)
+            if profiles.get_active(self._root) == old:
+                profiles.set_active(self._root, clean)
+            self._profile_name = clean
+            self._refresh_profile_combo()
+            self._refresh_auto_status()
+            self._set_status(f"Renamed profile to {clean}.")
+
+        self._profile_dialog("Rename profile", old, "Rename", rename)
+
+    def _on_profile_delete(self, _button) -> None:
+        self._finish_recording()
+        names = profiles.list_profiles(self._root)
+        if len(names) <= 1:
+            self._set_banner("Cannot delete the only profile.", "banner-error")
+            return
+        old = self._profile_name
+        try:
+            if profiles.get_active(self._root) == old:
+                self._switch_profile([n for n in names if n != old][0])
+            profiles.delete_profile(self._root, old)
+            self._auto_prune_profile(old)
+        except (OSError, ValueError) as exc:
+            self._set_banner(
+                f"Could not delete profile {old!r}: {exc}", "banner-error"
+            )
+            return
+        self._refresh_profile_combo()
+        self._refresh_auto_status()
+        if self._profile_name not in profiles.list_profiles(self._root):
+            # The daemon may have moved the pointer while we were open;
+            # never leave the window showing a profile that no longer exists.
+            active = profiles.get_active(self._root)
+            if active and active != self._profile_name:
+                self._switch_profile(active)
+                self._set_status(
+                    f"Deleted {old}. Now showing active profile {active}.")
+                return
+        self._set_status(f"Deleted profile {old}.")
+
+    # -- auto-switch -----------------------------------------------------
+    AUTO_UNIT = "omen-macro-auto.service"
+
+    def _build_auto_section(self) -> Gtk.Widget:
+        self.auto_expander = Gtk.Expander(label="Auto-switch profiles (optional)")
+        self.auto_expander.set_expanded(False)
+
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        inner.set_margin_top(6)
+
+        hint = Gtk.Label(xalign=0)
+        hint.set_wrap(True)
+        hint.add_css_class("dim-label")
+        hint.set_text(
+            "When on, a background service watches the focused app and switches "
+            "to the mapped profile. Your manual switches always win until "
+            "focus moves again. Matching is a case-insensitive substring of "
+            "the app name and window title; the first rule wins."
+        )
+        inner.append(hint)
+
+        enable_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        enable_row.append(Gtk.Label(label="Auto-switch", xalign=0))
+        self.auto_switch = Gtk.Switch()
+        self.auto_switch.set_tooltip_text(
+            "Enable the per-user auto-switch service "
+            f"({self.AUTO_UNIT}). Off by default."
+        )
+        self.auto_switch.connect("notify::active", self._on_auto_toggled)
+        enable_row.append(self.auto_switch)
+        self.auto_state = Gtk.Label(xalign=0)
+        self.auto_state.add_css_class("dim-label")
+        self.auto_state.set_hexpand(True)
+        enable_row.append(self.auto_state)
+        inner.append(enable_row)
+
+        fallback_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        fallback_row.append(Gtk.Label(label="When nothing matches, use:", xalign=0))
+        self.auto_fallback = Gtk.ComboBoxText()
+        self.auto_fallback.set_tooltip_text(
+            "Profile applied when no rule matches the focused app."
+        )
+        self.auto_fallback.connect("changed", self._on_auto_fallback_changed)
+        fallback_row.append(self.auto_fallback)
+        inner.append(fallback_row)
+
+        inner.append(Gtk.Label(label="Rules (first match wins):", xalign=0))
+        self.auto_rules_list = Gtk.ListBox()
+        self.auto_rules_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        inner.append(self.auto_rules_list)
+
+        add_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.auto_match_entry = Gtk.Entry()
+        self.auto_match_entry.set_hexpand(True)
+        self.auto_match_entry.set_placeholder_text("app text, e.g. cs2")
+        self.auto_match_entry.set_tooltip_text(
+            "Substring matched against the focused app name and window title"
+        )
+        self.auto_rule_profile = Gtk.ComboBoxText()
+        self.auto_rule_profile.set_tooltip_text("Profile to switch to on match")
+        add_btn = Gtk.Button(label="Add rule")
+        add_btn.connect("clicked", self._on_auto_rule_add)
+        self.auto_match_entry.connect("activate", lambda _e: self._on_auto_rule_add(None))
+        add_row.append(self.auto_match_entry)
+        add_row.append(self.auto_rule_profile)
+        add_row.append(add_btn)
+        inner.append(add_row)
+
+        detect_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.auto_detect = Gtk.Label(label="Focused now: (press Refresh)", xalign=0)
+        self.auto_detect.set_hexpand(True)
+        self.auto_detect.set_ellipsize(Pango.EllipsizeMode.END)
+        detect_btn = Gtk.Button(label="Refresh")
+        detect_btn.set_tooltip_text("Show what the daemon currently sees focused")
+        detect_btn.connect("clicked", lambda _b: self._on_auto_detect())
+        detect_row.append(self.auto_detect)
+        detect_row.append(detect_btn)
+        inner.append(detect_row)
+
+        self.auto_expander.set_child(inner)
+        return self.auto_expander
+
+    def _auto_enabled(self) -> bool | None:
+        """Whether the user unit is enabled; None when systemctl is unusable."""
+        try:
+            proc = subprocess.run(
+                ["systemctl", "--user", "is-enabled", self.AUTO_UNIT],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return proc.stdout.strip() == "enabled"
+
+    def _auto_running(self) -> str:
+        try:
+            proc = subprocess.run(
+                ["systemctl", "--user", "is-active", self.AUTO_UNIT],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return "unknown"
+        return proc.stdout.strip() or "unknown"
+
+    def _auto_set_enabled(self, on: bool) -> None:
+        cmd = ["systemctl", "--user", "enable" if on else "disable",
+               "--now", self.AUTO_UNIT]
+        try:
+            subprocess.run(["systemctl", "--user", "daemon-reload"],
+                           capture_output=True, timeout=15)
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise OSError(f"could not run systemctl: {exc}") from None
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "systemctl failed").strip()
+            raise OSError(detail)
+
+    def _on_auto_toggled(self, switch: Gtk.Switch, _param) -> None:
+        if self._auto_quiet:
+            return
+        # systemctl can block (we have seen the user bus stall for 25s+), so
+        # run it off the UI thread; the switch goes insensitive meanwhile.
+        # GTK is only touched from the idle callback below, never the worker.
+        want = switch.get_active()
+        switch.set_sensitive(False)
+        import threading
+
+        def work() -> None:
+            try:
+                self._auto_set_enabled(want)
+            except OSError as exc:
+                GLib.idle_add(self._auto_toggle_done, want, str(exc))
+            else:
+                GLib.idle_add(self._auto_toggle_done, want, None)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _auto_toggle_done(self, want: bool, error: str | None) -> bool:
+        self.auto_switch.set_sensitive(True)
+        if error is not None:
+            self._auto_quiet = True
+            try:
+                self.auto_switch.set_active(not want)
+            finally:
+                self._auto_quiet = False
+            self._set_banner(f"Auto-switch: {error}", "banner-error")
+        else:
+            self._set_banner("", "")
+            self._set_status(f"Auto-switch {'enabled' if want else 'disabled'}.")
+        self._refresh_auto_status()
+        return False
+
+    def _on_auto_fallback_changed(self, _combo) -> None:
+        if self._auto_quiet:
+            return
+        text = self.auto_fallback.get_active_text()
+        fallback = None if text == "(stay on current)" else text
+        try:
+            auto_switch.save_rules(
+                self._root, self._auto_rules, fallback)
+        except (OSError, ValueError) as exc:
+            self._set_banner(f"Auto-switch: {exc}", "banner-error")
+            return
+        self._auto_fallback = fallback
+
+    def _on_auto_rule_add(self, _button) -> None:
+        match = self.auto_match_entry.get_text().strip()
+        profile = self.auto_rule_profile.get_active_text()
+        if not match:
+            self._set_banner("Auto-switch: type the app text to match.",
+                             "banner-error")
+            return
+        if not profile:
+            self._set_banner("Auto-switch: pick a profile for the rule.",
+                             "banner-error")
+            return
+        self._auto_rules.append({"match": match, "profile": profile})
+        try:
+            auto_switch.save_rules(self._root, self._auto_rules,
+                                   self._auto_fallback)
+        except (OSError, ValueError) as exc:
+            self._auto_rules.pop()
+            self._set_banner(f"Auto-switch: {exc}", "banner-error")
+            return
+        self.auto_match_entry.set_text("")
+        self._set_banner("", "")
+        self._refresh_auto_rules()
+        self._set_status(f"Auto-switch: when {match!r} is focused, use {profile}.")
+
+    def _on_auto_rule_remove(self, index: int) -> None:
+        try:
+            removed = self._auto_rules.pop(index)
+        except IndexError:
+            return
+        try:
+            auto_switch.save_rules(self._root, self._auto_rules,
+                                   self._auto_fallback)
+        except (OSError, ValueError) as exc:
+            self._auto_rules.insert(index, removed)
+            self._set_banner(f"Auto-switch: {exc}", "banner-error")
+            return
+        self._refresh_auto_rules()
+
+    def _on_auto_rule_move(self, index: int, direction: int) -> None:
+        other = index + direction
+        if not 0 <= other < len(self._auto_rules):
+            return
+        self._auto_rules[index], self._auto_rules[other] = (
+            self._auto_rules[other], self._auto_rules[index])
+        try:
+            auto_switch.save_rules(self._root, self._auto_rules,
+                                   self._auto_fallback)
+        except (OSError, ValueError) as exc:
+            self._auto_rules[other], self._auto_rules[index] = (
+                self._auto_rules[index], self._auto_rules[other])
+            self._set_banner(f"Auto-switch: {exc}", "banner-error")
+            return
+        self._refresh_auto_rules()
+
+    def _on_auto_detect(self) -> None:
+        detected = auto_switch.active_window()
+        if detected is None:
+            self.auto_detect.set_text("Focused now: unknown (is the desktop running?)")
+        else:
+            app_name, win_title = detected
+            self.auto_detect.set_text(f"Focused now: {app_name} / {win_title}")
+
+    def _auto_prune_profile(self, name: str) -> None:
+        """Drop rules/fallback referencing a deleted profile, best effort."""
+        rules = [r for r in self._auto_rules if r.get("profile") != name]
+        fallback = None if self._auto_fallback == name else self._auto_fallback
+        if len(rules) == len(self._auto_rules) and fallback == self._auto_fallback:
+            return
+        try:
+            auto_switch.save_rules(self._root, rules, fallback)
+        except (OSError, ValueError):
+            return
+        self._auto_rules, self._auto_fallback = rules, fallback
+
+    def _refresh_auto_rules(self) -> None:
+        while True:
+            row = self.auto_rules_list.get_first_child()
+            if row is None:
+                break
+            self.auto_rules_list.remove(row)
+        for index, rule in enumerate(self._auto_rules):
+            list_row = Gtk.ListBoxRow()
+            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            for side in ("top", "bottom", "start", "end"):
+                getattr(box, f"set_margin_{side}")(2)
+            text = Gtk.Label(
+                label=f"\"{rule['match']}\" -> {rule['profile']}", xalign=0)
+            text.set_hexpand(True)
+            text.set_ellipsize(Pango.EllipsizeMode.END)
+            up = Gtk.Button(label="^")
+            up.set_tooltip_text("Move rule up (earlier rules win)")
+            up.connect("clicked", lambda _b, i=index: self._on_auto_rule_move(i, -1))
+            down = Gtk.Button(label="v")
+            down.set_tooltip_text("Move rule down")
+            down.connect("clicked", lambda _b, i=index: self._on_auto_rule_move(i, 1))
+            remove = Gtk.Button(label="Remove")
+            remove.connect("clicked",
+                           lambda _b, i=index: self._on_auto_rule_remove(i))
+            for widget in (text, up, down, remove):
+                box.append(widget)
+            list_row.set_child(box)
+            self.auto_rules_list.append(list_row)
+
+    def _refresh_auto_status(self) -> None:
+        try:
+            rules, fallback = auto_switch.load_rules(self._root)
+        except (OSError, ValueError):
+            rules, fallback = [], None
+        self._auto_rules = rules
+        self._auto_fallback = fallback
+
+        enabled = self._auto_enabled()
+        running = self._auto_running() if enabled is not None else "unknown"
+        self._auto_quiet = True
+        try:
+            self.auto_switch.set_active(bool(enabled))
+        finally:
+            self._auto_quiet = False
+        if enabled is None:
+            state = "systemctl unavailable"
+        elif enabled:
+            state = f"on ({running})"
+        else:
+            state = "off"
+        self.auto_state.set_text(f"service {state}")
+        self.auto_expander.set_label(f"Auto-switch profiles ({state})")
+
+        names = profiles.list_profiles(self._root)
+        self._auto_quiet = True
+        try:
+            self.auto_fallback.remove_all()
+            self.auto_fallback.append_text("(stay on current)")
+            for name in names:
+                self.auto_fallback.append_text(name)
+            if fallback in names:
+                self.auto_fallback.set_active(names.index(fallback) + 1)
+            else:
+                self.auto_fallback.set_active(0)
+            self.auto_rule_profile.remove_all()
+            for name in names:
+                self.auto_rule_profile.append_text(name)
+            if names:
+                self.auto_rule_profile.set_active(0)
+        finally:
+            self._auto_quiet = False
+        self._refresh_auto_rules()
 
     def _add_omen_row(self, listbox: Gtk.ListBox) -> None:
         """Append the OMEN logo-key row, same layout as the P-key rows.
@@ -579,7 +1017,8 @@ class MacroWindow(Gtk.ApplicationWindow):
         """Dialog to set the command run when key is pressed.
 
         key is "OMEN" or "P1".."P6". The command is stored in this window and
-        written to GNOME shortcuts on Bind; Save persists it to profile.json.
+        written to GNOME shortcuts on Bind; the persist step saves it to the
+        current profile.
         """
         is_omen = key == "OMEN"
         title = "OMEN key command" if is_omen else f"{key} command"
@@ -638,27 +1077,19 @@ class MacroWindow(Gtk.ApplicationWindow):
                         f"{key}: type a command first.", "banner-error"
                     )
                     return
-                try:
-                    omen_key.set_key_command(key, command)
-                except (OSError, ValueError) as exc:
-                    self._set_banner(
-                        f"{key}: could not save the shortcut ({exc})",
-                        "banner-error",
-                    )
-                    return
+                old = self.commands.get(key)
                 self.commands[key] = command
-                self._set_banner("", "")
-                if is_omen:
-                    self._refresh_omen_status()
-                    self._set_status(
-                        f"OMEN key now runs {command!r} (saved to GNOME shortcuts)."
-                    )
+                if key == "OMEN":
+                    label = f"OMEN key now runs {command!r}."
                 else:
-                    self._refresh_row(key)
-                    self._set_status(
-                        f"{key} now runs {command!r}. Press Apply to EC so "
-                        "its typing macro stops competing with it."
-                    )
+                    label = (f"{key} now runs {command!r}; its typing macro "
+                             "is left out of the upload.")
+                if not self._persist(label):
+                    if old is None:
+                        del self.commands[key]
+                    else:
+                        self.commands[key] = old
+                    return
             dialog.close()
 
         cancel.connect("clicked", lambda _b: done(False))
@@ -676,15 +1107,12 @@ class MacroWindow(Gtk.ApplicationWindow):
 
     def _on_omen_remove_clicked(self, _button) -> None:
         self._finish_recording()
-        try:
-            omen_key.clear_key_command("OMEN")
-        except OSError as exc:
-            self._set_banner(f"OMEN key: could not remove the shortcut ({exc})", "banner-error")
+        old = self.commands.pop("OMEN", None)
+        if old is None:
+            self._set_status("OMEN key was already unbound.")
             return
-        self.commands.pop("OMEN", None)
-        self._set_banner("", "")
-        self._refresh_omen_status()
-        self._set_status("OMEN key binding removed.")
+        if not self._persist("OMEN key binding removed."):
+            self.commands["OMEN"] = old
 
     def _build_status_area(self) -> Gtk.Widget:
         frame = Gtk.Frame(label="EC status")
@@ -709,40 +1137,24 @@ class MacroWindow(Gtk.ApplicationWindow):
         hint.set_wrap(True)
         hint.add_css_class("dim-label")
         hint.set_text(
-            "Apply sends this window to the keyboard now (the EC forgets it "
-            "on reboot). Save stores this window to profile.json, which the "
-            "boot service re-applies. Save & Apply does both."
+            "Every change saves the current profile and sends it to the "
+            "keyboard automatically. Switching profiles applies that profile."
         )
         footer.append(hint)
 
         bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
 
-        self.apply_btn = Gtk.Button(label="Apply to EC")
-        self.apply_btn.add_css_class("suggested-action")
-        self.apply_btn.set_tooltip_text(
-            "Send this window's macros to the keyboard controller now. "
-            "Works immediately, but the controller forgets it when the "
-            "power is off - Save first if you want it to survive reboot."
+        self.reapply_btn = Gtk.Button(label="Re-apply")
+        self.reapply_btn.set_tooltip_text(
+            "Re-send the current profile to the keyboard and shortcuts "
+            "(recovery if the keys stop responding)."
         )
-        self.apply_btn.connect("clicked", self._on_apply_clicked)
-
-        self.save_btn = Gtk.Button(label="Save")
-        self.save_btn.set_tooltip_text(
-            f"Store this window to {config_path()}. The boot service "
-            "re-applies that file at startup. Does not touch the keyboard now."
-        )
-        self.save_btn.connect("clicked", self._on_save_clicked)
-
-        self.save_apply_btn = Gtk.Button(label="Save & Apply")
-        self.save_apply_btn.set_tooltip_text(
-            "Save to profile.json and send to the keyboard now."
-        )
-        self.save_apply_btn.connect("clicked", self._on_save_apply_clicked)
+        self.reapply_btn.connect("clicked", lambda _b: self._persist("Re-applied."))
 
         self.defaults_btn = Gtk.Button(label="Load defaults")
         self.defaults_btn.set_tooltip_text(
-            "Replace this window with the stock numpad layout. Nothing is "
-            "saved or sent until you Save or Apply."
+            "Replace this window with the stock numpad layout, saved and "
+            "sent immediately."
         )
         self.defaults_btn.connect("clicked", self._on_defaults_clicked)
 
@@ -752,7 +1164,7 @@ class MacroWindow(Gtk.ApplicationWindow):
         self.stop_btn.set_visible(False)
         self.stop_btn.connect("clicked", lambda _btn: self._finish_recording())
 
-        for widget in (self.apply_btn, self.save_btn, self.save_apply_btn, self.defaults_btn):
+        for widget in (self.reapply_btn, self.defaults_btn):
             bar.append(widget)
 
         spacer = Gtk.Box()
@@ -842,37 +1254,31 @@ class MacroWindow(Gtk.ApplicationWindow):
         chords = [list(chord) for chord in rec.chords if chord]
         if chords:
             self.slots[slot] = chords
-            self._set_status(
-                f"{slot} = {codec.describe_entry(chords)} "
-                "(not applied yet - press Apply to EC)"
-            )
+            self._persist(f"{slot} = {codec.describe_entry(chords)}.")
         else:
             self._set_status(f"{slot}: no keys captured, nothing changed.")
-        self._refresh_row(slot)
+            self._refresh_row(slot)
 
     def _on_clear_clicked(self, slot: str) -> None:
         if self.recording_slot == slot:
             self._finish_recording()
         macro = self.slots.pop(slot, None)
         command = self.commands.pop(slot, None)
-        if command is not None:
-            try:
-                omen_key.clear_key_command(slot)
-            except OSError as exc:
-                self.commands[slot] = command  # keep config consistent with dconf
-                self._set_banner(
-                    f"{slot}: could not remove the shortcut ({exc})", "banner-error"
-                )
-                self._refresh_row(slot)
-                return
         if macro is None and command is None:
             self._set_status(f"{slot} was already empty.")
-        elif command is not None:
-            self._set_status(
-                f"{slot} cleared: macro removed, command {command!r} removed."
-            )
-        else:
-            self._set_status(f"{slot} cleared (not applied yet - press Apply to EC)")
+            self._refresh_row(slot)
+            return
+        detail = f"{slot} cleared"
+        if command is not None:
+            detail += f": macro and command {command!r} removed"
+        detail += "."
+        if self._persist(detail):
+            return
+        # Roll back so the window still matches the file and shortcuts.
+        if macro is not None:
+            self.slots[slot] = macro
+        if command is not None:
+            self.commands[slot] = command
         self._refresh_row(slot)
 
     def _sync_recording_ui(self) -> None:
@@ -990,31 +1396,22 @@ class MacroWindow(Gtk.ApplicationWindow):
         else:
             self._set_banner("", "")
 
-    def _config_status(self, path: Path, state: str) -> str:
-        line = f"config: {path} ({state})"
-        if path == FALLBACK_CONFIG:
-            line += " - fallback, /etc/omen-macro is missing (run install.sh)"
-        return line
+    def _profile_line(self) -> str:
+        return f"profile: {self._profile_name or '(none)'} ({self._root})"
 
-    def _load_config(self) -> None:
-        path = config_path()
+    def _load_store(self) -> None:
+        """Load the store, then the active profile, into the window."""
+        self._loading = True
         try:
-            cfg, found = load_config(path)
-        except PermissionError as exc:
-            self._config_line = self._config_status(path, "permission denied")
-            self._set_banner(
-                f"permission denied reading {path}: {exc}", "banner-error"
-            )
-            return
+            self._root = profiles.config_root()
+            self._profile_name = profiles.ensure_store(self._root)
+            cfg, _, _ = profiles.resolve_config(self._root)
+            self._apply_config_dict(cfg)
+            self._refresh_profile_combo()
         except (OSError, ValueError) as exc:
-            self._config_line = self._config_status(path, "unreadable, starting empty")
-            self._set_banner(f"Could not read {path}: {exc}", "banner-error")
-            return
-        if not found:
-            self._config_line = self._config_status(path, "none yet, starting empty")
-            return
-        self._apply_config_dict(cfg)
-        self._config_line = self._config_status(path, "loaded")
+            self._set_banner(f"Could not load profiles: {exc}", "banner-error")
+        finally:
+            self._loading = False
 
     # -- hardware / saving -------------------------------------------------
     def _device_line(self) -> str:
@@ -1022,8 +1419,8 @@ class MacroWindow(Gtk.ApplicationWindow):
         state = "present" if path.exists() else MSG_NO_HW
         return f"device: {path} ({state})"
 
-    def _on_apply_clicked(self, _button) -> None:
-        self._finish_recording()
+    def _upload_ec(self) -> tuple[bool, str]:
+        """Send the current window (minus command-bound slots) to the EC."""
         sysfs = sysfs_dir()
         path = sysfs / PROFILE_ATTR
         try:
@@ -1031,79 +1428,69 @@ class MacroWindow(Gtk.ApplicationWindow):
         except codec.MacroError as exc:
             self._set_banner(f"Cannot encode the macro table: {exc}", "banner-error")
             self._set_status("Profile not written.")
-            return
-
+            return False, ""
         try:
             written = write_profile(profile, sysfs)
         except (FileNotFoundError, NotADirectoryError):
             self._set_banner(MSG_NO_HW, "banner-error")
             self._set_status(f"{path} does not exist.")
-            return
+            return False, ""
         except PermissionError:
             self._set_banner(MSG_NO_PERM, "banner-error")
             self._set_status(f"Permission denied writing {path}.")
-            return
+            return False, ""
         except OSError as exc:
             self._set_banner(f"EC rejected the profile: {exc}", "banner-error")
             self._set_status(f"macro_status: {read_status(sysfs)}")
-            return
-
-        self._set_banner("", "")
+            return False, ""
+        status = (f"wrote {written} bytes to {path}\n"
+                  f"macro_status: {read_status(sysfs)}")
         skipped = [k for k in omen_key.COMMANDABLE_PKEYS if k in self.commands]
-        note = ""
         if skipped:
-            note = (
-                f"\n{', '.join(skipped)} run commands, "
-                "so their typing macros were not uploaded."
-            )
-        self._set_status(
-            f"wrote {written} bytes to {path}\nmacro_status: {read_status(sysfs)}"
-            f"{note}"
-        )
+            status += (f"\n{', '.join(skipped)} run commands, "
+                       "so their typing macros were not uploaded.")
+        return True, status
 
-    def _on_save_clicked(self, _button) -> bool:
-        self._finish_recording()
-        cfg = self._config()
-        path = config_path()
+    def _persist(self, note: str = "") -> bool:
+        """Save the window to the current profile, sync shortcuts, upload.
+
+        This is the only write path: every mutation funnels through here, so
+        the file, the shortcuts and the EC can never disagree for long.
+        """
         try:
-            if path == FALLBACK_CONFIG:
-                # Only the dev-checkout fallback is ours to create;
-                # /etc/omen-macro belongs to install.sh.
-                path.parent.mkdir(parents=True, exist_ok=True)
-            path = save_config(cfg, path)
-        except PermissionError as exc:
-            # Never fall back quietly here: a permission error means the
-            # install is broken and the user must see the real error.
-            self._set_banner(
-                f"permission denied writing {path}: {exc}", "banner-error"
-            )
-            self._set_status(f"{path} was not written.")
+            profiles.save_profile(self._root, self._profile_name, self._config())
+        except (OSError, ValueError) as exc:
+            self._set_banner(f"Could not save profile: {exc}", "banner-error")
             return False
-        except OSError as exc:
-            self._set_banner(f"Could not save {path}: {exc}", "banner-error")
-            self._set_status(f"{path} was not written.")
+        try:
+            omen_key.sync_commands(self.commands)
+        except (OSError, ValueError) as exc:
+            self._set_banner(f"Shortcuts out of sync: {exc}", "banner-error")
+            return False
+        ok, upload_status = self._upload_ec()
+        if not ok:
             return False
         self._set_banner("", "")
-        count = sum(len(chords) for chords in cfg["slots"].values())
-        self._set_status(f"saved {count} chord(s) in {len(cfg['slots'])} slot(s) to {path}")
+        self._refresh_all()
+        self._refresh_omen_status()
+        head = f"Saved to {self._profile_name}, applied to EC."
+        if note:
+            head += f" {note}"
+        self._set_status(f"{head}\n{upload_status}")
         return True
-
-    def _on_save_apply_clicked(self, _button) -> None:
-        if self._on_save_clicked(_button):
-            self._on_apply_clicked(_button)
 
     def _on_defaults_clicked(self, _button) -> None:
         self._finish_recording()
-        self.slots = {
-            name: [list(chord) for chord in chords]
-            for name, chords in codec.NUMPAD_DEFAULT.items()
-        }
-        self.spacing.set_value(DEFAULT_SPACING_MS)
-        self._refresh_all()
-        self._set_banner("", "")
-        self._set_status(
-            "Loaded the stock numpad layout (not applied yet - press Apply to EC)."
-        )
+        self._loading = True
+        try:
+            self.slots = {
+                name: [list(chord) for chord in chords]
+                for name, chords in codec.NUMPAD_DEFAULT.items()
+            }
+            self.spacing.set_value(DEFAULT_SPACING_MS)
+        finally:
+            self._loading = False
+        self._persist("Loaded the stock numpad layout.")
 
     # -- status ------------------------------------------------------------
     def _set_status(self, text: str) -> None:
@@ -1277,6 +1664,28 @@ def selftest() -> int:
     migrated, _ = omen_key.normalize_commands(
         {"omen_key": {"command": "omen-macro"}})
     check("legacy omen_key migrates", migrated, {"OMEN": "omen-macro"})
+
+    # 10. Profiles: seed + resolve in a temp root (no touch of real config).
+    import tempfile
+    troot = Path(tempfile.mkdtemp(prefix="omen-selftest-"))
+    check("profiles seed Default",
+          (profiles.ensure_store(troot), profiles.list_profiles(troot)),
+          ("Default", ["Default"]))
+    cfg, name, _ = profiles.resolve_config(troot)
+    check("profiles resolve seeded",
+          (name, cfg["slots"]["P1"]), ("Default", [["KP_1"]]))
+    profiles.save_profile(troot, "Gaming", {"spacing_ms": 0, "slots": {}})
+    profiles.set_active(troot, "Gaming")
+    check("profiles switch", profiles.get_active(troot), "Gaming")
+
+    # 11. Auto-switch matcher: first rule wins, case-insensitive.
+    check("auto match first wins",
+          auto_switch.match_app(
+              "Firefox", "t",
+              [{"match": "fire", "profile": "A"},
+               {"match": "firefox", "profile": "B"}]),
+          "A")
+    check("auto match none", auto_switch.match_app("a", "b", []), None)
 
     print()
     if failures:

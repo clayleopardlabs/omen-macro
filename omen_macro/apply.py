@@ -10,7 +10,9 @@ hp-wmi platform device:
                     attempt, for diagnostics.
 
 Usage:
-    omen-macro-apply                 # apply /etc/omen-macro/profile.json
+    omen-macro-apply                 # apply the active profile
+    omen-macro-apply --profile NAME  # apply one profile without switching
+    omen-macro-apply --list-profiles # show profiles, * marks the active one
     omen-macro-apply --default       # apply the stock numpad layout
     omen-macro-apply --dry-run       # encode and summarise, touch nothing
     omen-macro-apply --status        # just print macro_status
@@ -27,8 +29,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from omen_macro import codec  # noqa: E402
+from omen_macro import profiles  # noqa: E402
 
-DEFAULT_CONFIG = Path("/etc/omen-macro/profile.json")
 SYSFS = Path(os.environ.get("OMEN_MACRO_SYSFS", "/sys/devices/platform/hp-wmi"))
 
 
@@ -68,7 +70,12 @@ def summarise(cfg: dict) -> str:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    ap.add_argument("--config", type=Path, default=None,
+                    help="apply one explicit file instead of a profile")
+    ap.add_argument("--profile", default=None,
+                    help="apply this profile without changing the active one")
+    ap.add_argument("--list-profiles", action="store_true",
+                    help="show profiles (* marks the active one) and exit")
     ap.add_argument("--sysfs", type=Path, default=SYSFS)
     ap.add_argument("--default", action="store_true",
                     help="apply the stock numpad layout instead of a config file")
@@ -82,15 +89,32 @@ def main(argv: list[str] | None = None) -> int:
         print(read_status(args.sysfs))
         return 0
 
+    root = profiles.config_root()
+    if args.list_profiles:
+        active = profiles.ensure_store(root)
+        for name in profiles.list_profiles(root):
+            print(("* " if name == active else "  ") + name)
+        return 0
+
     if args.clear:
         cfg = {"spacing_ms": 0, "slots": {}}
+        label = "(cleared table)"
     elif args.default:
         cfg = {"spacing_ms": 20, "slots": codec.NUMPAD_DEFAULT}
-    else:
+        label = "(stock layout)"
+    elif args.config is not None:
         if not args.config.is_file():
             print(f"no config at {args.config}; use --default", file=sys.stderr)
             return 2
         cfg = load_config(args.config)
+        label = f"({args.config})"
+    else:
+        try:
+            cfg, name, path = profiles.resolve_config(root, prefer=args.profile)
+        except (OSError, ValueError, FileNotFoundError) as exc:
+            print(f"profile error: {exc}", file=sys.stderr)
+            return 2
+        label = f"(profile {name})"
 
     try:
         profile = codec.config_to_profile(cfg)
@@ -99,7 +123,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     print(summarise(cfg))
-    print(f"encoded {len(profile)} bytes, {sum(1 for b in profile if b)} non-zero")
+    print(f"{label}: encoded {len(profile)} bytes, "
+          f"{sum(1 for b in profile if b)} non-zero")
 
     if args.dry_run:
         return 0

@@ -1,0 +1,18 @@
+[Unit]
+Description=OMEN macro auto-switch daemon (focused-app profiles)
+Documentation=file:///usr/local/lib/omen-macro/README.md
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/omen-macro-auto
+Restart=on-failure
+RestartSec=5
+# AT-SPI and dconf both live on the user session bus; there is deliberately
+# no WantedBy here - the GUI enables this unit per user (systemctl --user).
+# It stays off unless the user opts in, and the boot-time EC upload does not
+# depend on it.
+
+[Install]
+WantedBy=default.target

@@ -53,10 +53,15 @@ policy in userspace where it can be edited without rebuilding a module.
 
 * `codec.py` - scan-code table, chord/delay encoder, profile builder, decoder
   for UI summaries. Pure stdlib, unit-tested.
-* `apply.py` - CLI: upload a JSON profile, the stock numpad layout, or a blank
-  table; `--dry-run` and `--status`.
-* `gui.py` - GTK4 app ("OMEN Macro Keys") with key recording, per-key macros,
-  adjustable replay spacing, and EC status readout.
+* `apply.py` - CLI: upload the active profile, one named profile, the stock
+  numpad layout, or a blank table; `--list-profiles`, `--dry-run`, `--status`.
+* `gui.py` - GTK4 app ("OMEN Macro Keys") with key recording, per-key macros
+  and commands, named profiles, optional auto-switch, and EC status readout.
+* `profiles.py` - named-profile store shared by the GUI, the CLI and the
+  boot service (`profiles/<name>.json` plus an `active-profile` pointer).
+* `auto_switch.py` - optional per-user daemon: switches profiles with the
+  focused app. Off unless enabled in the GUI.
+* `ec.py` - the 4096-byte EC upload helper both upload paths share.
 
 ### Table format (for anyone extending this)
 
@@ -76,8 +81,10 @@ sudo ./install.sh
 ```
 
 The installer backs up `hp-wmi.c`, patches it, rebuilds/reinstalls the DKMS
-package, reloads `hp_wmi`, installs the userspace tools, adds the udev rule and
-the boot service, and uploads a default numpad profile.
+package, reloads `hp_wmi`, installs the userspace tools, adds the udev rule,
+the boot service and the (opt-in) per-user auto-switch service, and uploads
+the active profile. First run seeds a Default numpad profile, migrating a
+legacy `profile.json` if you have one.
 
 **Verify:** press `P1` - it should type a numpad `1`. Or:
 
@@ -97,16 +104,26 @@ omen-macro # GUI (also "OMEN Macro Keys" in the app grid)
 
 ![OMEN Macro Keys GUI](screenshot.webp)
 
-Click **Record** on a key, type the sequence, press **Stop**, then **Apply to
-EC**. Recording captures *key order only*; the "Spacing between key presses"
-spinbox sets the delay inserted between keystrokes when the EC replays them.
-Macros are saved to `/etc/omen-macro/profile.json` and re-uploaded at boot by
-`omen-macro-apply.service`.
+Click **Record** on a key, type the sequence, press **Stop**. Recording
+captures *key order only*; the "Spacing between key presses" spinbox sets the
+delay inserted between keystrokes when the EC replays them. **Every change
+saves the current profile and sends it to the keyboard immediately** - there
+is no separate save step, and the boot service re-applies the active profile
+after a restart.
+
+### Profiles
+
+The profile switcher sits at the top of the window. New creates a profile as
+a copy of the current one, Rename renames it, Delete removes it (the last
+profile cannot go). Switching profiles applies that profile at once. The old
+single `profile.json`, if you have one, is imported as Default on first run.
 
 CLI equivalents:
 
 ```bash
-omen-macro-apply --config /etc/omen-macro/profile.json
+omen-macro-apply # upload the active profile
+omen-macro-apply --profile Gaming # upload one profile without switching
+omen-macro-apply --list-profiles # show profiles (* marks the active one)
 omen-macro-apply --default # stock numpad layout
 omen-macro-apply --clear # all slots empty
 omen-macro-apply --dry-run # encode + summarise, touch nothing
@@ -118,29 +135,47 @@ Every P-key row and the OMEN row have a command option alongside the macro:
 
 - P1-P6: the Cmd button binds KP_1-KP_6 to any command you type. While a
   command is set, that key's typing macro is left out of the EC upload, so the
-  key runs the command instead of typing. Press Apply to EC to make the switch
-  take effect. Fn+P combinations still replay their own slots. Note: a USB
-  keyboard with a real numpad sends the same keysyms, so it would also trigger
-  these shortcuts.
+  key runs the command instead of typing. Fn+P combinations still replay their
+  own slots. Note: a USB keyboard with a real numpad sends the same keysyms,
+  so it would also trigger these shortcuts.
 - OMEN (logo key): the logo key is not an EC macro slot. It always sends
   KEY_PROG2 (XF86Launch2), so there is nothing to upload. Set opens a dialog
   for the command it should run (default `omen-macro`), Clear removes the
   shortcut.
 
 The GUI owns one GNOME custom shortcut per configured key and leaves your
-other shortcuts alone. Commands are stored in profile.json under `commands`
-and survive reboot like the macros. Older files using `omen_key` still load.
+other shortcuts alone. Commands live in the profile under `commands` and
+survive reboot like the macros. Older files using `omen_key` still load.
 
 ### What the buttons do
 
-- Apply to EC: sends this window's macros to the keyboard controller right
-  now. Works immediately, but the controller forgets the table when the power
-  is off.
-- Save: stores this window (macros, spacing, commands) to profile.json. The
-  boot service re-applies that file at startup. Does not touch the keyboard.
-- Save & Apply: Save, then Apply to EC.
-- Load defaults: replaces this window with the stock numpad layout. Nothing
-  is saved or sent until you Save or Apply.
+The footer buttons are deliberately few: everything else applies itself.
+
+- Re-apply: re-sends the current profile to the keyboard and shortcuts
+  (recovery if the keys stop responding).
+- Load defaults: replaces this window with the stock numpad layout, saved
+  and sent immediately.
+
+### Auto-switch profiles (optional, off by default)
+
+A per-user background service watches the focused app and switches profiles
+for you - for example a Gaming profile while a game is focused, back to
+Default otherwise. Matching is a case-insensitive substring of the app name
+and window title; the first rule wins. Your manual switches always win until
+focus moves again: the daemon only acts when the focused *application*
+changes.
+
+Set it up in the GUI under "Auto-switch profiles": flip the switch on, add
+rules (app text plus profile), pick the fallback profile for when nothing
+matches, and use Refresh to see what the daemon currently sees focused. The
+service logs to the journal:
+
+```bash
+journalctl --user -u omen-macro-auto.service
+```
+
+It needs a running desktop with accessibility services (standard on GNOME)
+and does nothing when they are unavailable.
 
 ## Limitations
 
@@ -163,8 +198,8 @@ sudo ./revert.sh
 ```
 
 Clears the EC table, restores the backed-up `hp-wmi.c`, rebuilds the DKMS
-module, and removes the udev rule, service and installed binaries. The config
-file is kept.
+module, and removes the udev rule, services and installed binaries. The config
+directory (`/etc/omen-macro`) is kept.
 
 ## Troubleshooting
 
@@ -200,6 +235,10 @@ slower, because it rebuilds the DKMS package.
 
 ```bash
 python3 tests/test_codec.py # encoder format tests, no hardware needed
+python3 tests/test_profiles.py # profile store, migration, active pointer
+python3 tests/test_omen_key.py # shortcut helpers (plus a read-only live check)
+python3 tests/test_auto_switch.py # focus matcher, rules file (plus live probe)
+python3 -m omen_macro.gui --selftest # recording + encoder + profiles + matcher
 ```
 
 ## Credits

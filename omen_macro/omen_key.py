@@ -327,6 +327,38 @@ def clear_key_command(key: str) -> None:
     set_custom_paths(remove_binding_path(get_custom_paths(), key_path(key)))
 
 
+def sync_commands(commands: dict) -> None:
+    """Make dconf match commands exactly ({key: command}).
+
+    Keys missing from commands are unbound. Unknown keys raise ValueError.
+    Idempotent: entries that already match are left alone.
+    """
+    wanted: dict[str, str] = {}
+    for key, cmd in (commands or {}).items():
+        if key not in COMMANDABLE_KEYS:
+            raise ValueError(f"cannot bind {key!r}")
+        if isinstance(cmd, str) and cmd.strip():
+            wanted[key] = cmd.strip()
+    try:
+        paths = get_custom_paths()
+    except OSError as exc:
+        raise OSError(f"cannot read GNOME custom shortcuts: {exc}") from None
+    for key in COMMANDABLE_KEYS:
+        path, accel = key_path(key), key_accel(key)
+        if key in wanted:
+            current = None
+            if path in paths:
+                try:
+                    current = get_binding(path)
+                except OSError:
+                    current = None
+            if (not current or current.get("command") != wanted[key]
+                    or current.get("binding") != accel):
+                set_binding(path, key_display_name(key), wanted[key], accel)
+        elif path in paths:
+            clear_key_command(key)
+
+
 def normalize_commands(cfg: dict) -> tuple[dict, list[str]]:
     """Split config into ({key: command}, [problems]).
 

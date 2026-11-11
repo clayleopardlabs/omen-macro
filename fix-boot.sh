@@ -26,8 +26,21 @@ udevadm control --reload-rules || true
 
 say "installing systemd unit (starts early instead of after multi-user.target)"
 install -Dm644 "${SCRIPT_DIR}/systemd/omen-macro-apply.service" /etc/systemd/system/omen-macro-apply.service
+install -Dm644 "${SCRIPT_DIR}/systemd/omen-macro-auto.service" /etc/systemd/user/omen-macro-auto.service
 systemctl daemon-reload
 systemctl enable omen-macro-apply.service >/dev/null
+
+say "repairing config tree ownership (root:omen-hw so GUI users can save)"
+chgrp omen-hw /etc/omen-macro 2>/dev/null || true
+chmod 2775 /etc/omen-macro 2>/dev/null || true
+find /etc/omen-macro -maxdepth 1 -type f -exec chgrp omen-hw {} + 2>/dev/null || true
+find /etc/omen-macro -maxdepth 1 -type f -exec chmod 0664 {} + 2>/dev/null || true
+if [[ -d /etc/omen-macro/profiles ]]; then
+	chgrp omen-hw /etc/omen-macro/profiles 2>/dev/null || true
+	chmod 2775 /etc/omen-macro/profiles 2>/dev/null || true
+	find /etc/omen-macro/profiles -maxdepth 1 -type f -exec chgrp omen-hw {} + 2>/dev/null || true
+	find /etc/omen-macro/profiles -maxdepth 1 -type f -exec chmod 0664 {} + 2>/dev/null || true
+fi
 
 say "re-uploading the profile and repairing permissions"
 systemctl restart omen-macro-apply.service || true

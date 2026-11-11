@@ -13,7 +13,9 @@ RemainAfterExit=yes
 # the driver ourselves, then wait for the attribute it creates in probe.
 ExecStartPre=-/sbin/modprobe hp_wmi
 ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do [ -e /sys/devices/platform/hp-wmi/macro_profile ] && exit 0; sleep 0.25; done; echo "hp-wmi macro_profile never appeared" >&2; exit 1'
-ExecStart=/usr/local/bin/omen-macro-apply --config /etc/omen-macro/profile.json
+# No --config: the tool resolves the active profile (profiles/<name>.json),
+# seeding and migrating the store on first run.
+ExecStart=/usr/local/bin/omen-macro-apply
 # udev can see the platform device before the driver creates the attributes, so
 # grant the omen-hw group write access here too instead of relying on the udev
 # rule alone.

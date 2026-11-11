@@ -7,11 +7,13 @@
 #   1. backs up and patches /usr/src/hp-omen-extra-2.1.2/hp-wmi.c so the driver
 #      exposes a writable 4096-byte EC macro table (macro_profile/macro_status)
 #   2. rebuilds + reinstalls the hp-omen-extra DKMS package and reloads it
-#   3. installs the userspace encoder, CLI and GTK GUI to /usr/local
+#   3. installs the userspace encoder, CLI, daemon and GTK GUI to /usr/local
 #   4. grants the omen-hw group write access to macro_profile (udev rule)
-#   5. installs a oneshot systemd unit that re-uploads the saved profile at boot
-#      (the EC forgets it on a cold boot)
-#   6. uploads a default profile so P1-P6 emit numpad 1-6 immediately
+#   5. installs a oneshot systemd unit that re-uploads the active profile
+#      at boot (the EC forgets it on a cold boot), plus a per-user unit for
+#      the optional auto-switch daemon (off unless enabled in the GUI)
+#   6. uploads the active profile so P1-P6 emit numpad 1-6 immediately
+#      (first run seeds a Default profile, migrating legacy profile.json)
 #
 # Revert with ./revert.sh
 set -euo pipefail
@@ -92,37 +94,31 @@ cat > /usr/local/bin/omen-macro-apply <<'LAUNCHER'
 export PYTHONPATH=/usr/local/lib/omen-macro${PYTHONPATH:+:$PYTHONPATH}
 exec python3 -m omen_macro.apply "$@"
 LAUNCHER
-chmod 755 /usr/local/bin/omen-macro /usr/local/bin/omen-macro-apply
+cat > /usr/local/bin/omen-macro-auto <<'LAUNCHER'
+#!/bin/sh
+export PYTHONPATH=/usr/local/lib/omen-macro${PYTHONPATH:+:$PYTHONPATH}
+exec python3 -m omen_macro.auto_switch "$@"
+LAUNCHER
+chmod 755 /usr/local/bin/omen-macro /usr/local/bin/omen-macro-apply /usr/local/bin/omen-macro-auto
 install -Dm644 "${SCRIPT_DIR}/desktop/omen-macro.desktop" /usr/share/applications/omen-macro.desktop
 
 # ---------------------------------------------------------------- 4. config
+# Seeding happens at runtime: the first apply (below) or GUI start migrates a
+# legacy profile.json and writes profiles/Default.json + active-profile.
 install -d -g omen-hw -m 2775 /etc/omen-macro
-if [[ ! -f /etc/omen-macro/profile.json ]]; then
-	python3 - <<'PY'
-import json
-cfg = {"spacing_ms": 20, "slots": {
-    "P1": [["KP_1"]], "P2": [["KP_2"]], "P3": [["KP_3"]],
-    "P4": [["KP_4"]], "P5": [["KP_5"]], "P6": [["KP_6"]],
-    "Fn+P1": [["KP_7"]], "Fn+P2": [["KP_8"]], "Fn+P3": [["KP_9"]],
-    "Fn+P4": [["KP_0"]], "Fn+P5": [["KP_Subtract"]], "Fn+P6": [["KP_Add"]],
-}}
-with open("/etc/omen-macro/profile.json", "w") as fh:
-    json.dump(cfg, fh, indent=2)
-    fh.write("\n")
-PY
-	chgrp omen-hw /etc/omen-macro/profile.json
-	chmod 0664 /etc/omen-macro/profile.json
-fi
 
 # ---------------------------------------------------------------- 5. boot service
 install -Dm644 "${SCRIPT_DIR}/systemd/omen-macro-apply.service" /etc/systemd/system/omen-macro-apply.service
 systemctl daemon-reload
 systemctl enable omen-macro-apply.service >/dev/null
 
+# Optional auto-switch daemon: per-user unit, stays off until the GUI opts in.
+install -Dm644 "${SCRIPT_DIR}/systemd/omen-macro-auto.service" /etc/systemd/user/omen-macro-auto.service
+
 # ---------------------------------------------------------------- 6. apply now
-say "uploading the default profile"
+say "uploading the active profile"
 if [[ ${RELOADED} -eq 1 ]]; then
-	omen-macro-apply --config /etc/omen-macro/profile.json || {
+	omen-macro-apply || {
 		echo
 		echo "The EC did not accept the profile (see codes above)."
 		echo "Nothing is broken: the macro engine simply stays disabled."

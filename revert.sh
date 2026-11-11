@@ -3,7 +3,7 @@
 #
 #   sudo ./revert.sh
 #
-# Your /etc/omen-macro/profile.json is kept (harmless, a few hundred bytes).
+# Your /etc/omen-macro config dir is kept (profiles, harmless).
 set -euo pipefail
 
 KSRC="/usr/src/hp-omen-extra-2.1.2"
@@ -21,6 +21,10 @@ fi
 
 systemctl disable --now omen-macro-apply.service 2>/dev/null || true
 rm -f /etc/systemd/system/omen-macro-apply.service
+rm -f /etc/systemd/user/omen-macro-auto.service
+if [[ -n "${SUDO_USER:-}" ]]; then
+	sudo -u "${SUDO_USER}" systemctl --user disable --now omen-macro-auto.service 2>/dev/null || true
+fi
 systemctl daemon-reload || true
 rm -f /etc/udev/rules.d/99-omen-macro.rules
 udevadm control --reload-rules || true
@@ -40,10 +44,10 @@ else
 	echo "no hp-wmi.c backup found under ${KSRC}; reinstall the DKMS package by hand" >&2
 fi
 
-rm -f /usr/local/bin/omen-macro /usr/local/bin/omen-macro-apply
+rm -f /usr/local/bin/omen-macro /usr/local/bin/omen-macro-apply /usr/local/bin/omen-macro-auto
 rm -rf /usr/local/lib/omen-macro
 rm -f /usr/share/applications/omen-macro.desktop
 
 echo
 echo "Done. If hp_wmi could not be unloaded, reboot to get the original driver back."
-echo "Config kept at /etc/omen-macro/profile.json."
+echo "Config kept in /etc/omen-macro/ (profiles + rules)."
