@@ -9,7 +9,38 @@
 
 ## Install
 
-### 1. Get the code
+### Option A: the .deb package (easiest)
+
+Download `omen-macro_1.0.0_all.deb` from the
+[latest release](https://github.com/clayleopardlabs/omen-macro/releases/latest)
+and install it:
+
+```bash
+sudo apt install ./omen-macro_1.0.0_all.deb
+```
+
+The package needs the `hp-omen-extra` DKMS package on the machine (it patches
+that driver). Its post-install step patches the driver, builds the module,
+loads it and sends the default profile. It also enables the boot service and
+adds the user who ran `apt` to the `omen-hw` group (log out and back in once).
+
+If the kernel step cannot run, the app is still installed and the output says
+what to run later:
+
+```bash
+sudo /usr/lib/omen-macro/kernel-setup.sh
+```
+
+Remove it with `sudo apt remove omen-macro`. The pre-remove step clears the
+macro table and puts the original driver back. `sudo apt purge omen-macro`
+also deletes `/etc/omen-macro` (your profiles).
+
+Package files live in `/usr/bin`, `/usr/lib/omen-macro`,
+`/usr/share/doc/omen-macro` and `/usr/lib/systemd`, instead of `/usr/local`.
+
+### Option B: install from the source archive
+
+#### 1. Get the code
 
 Use the latest GitHub release (no git needed):
 
@@ -21,7 +52,7 @@ git clone https://github.com/clayleopardlabs/omen-macro.git
 cd omen-macro
 ```
 
-### 2. Run the installer
+#### 2. Run the installer
 
 Open a terminal in the folder that contains `install.sh`:
 

@@ -33,6 +33,18 @@ DISPLAY=:0 python3 tests/render_ui.py --only macros,editor
 
 Without a display it prints `SKIPPED` and exits 0.
 
+## Building the Debian package
+
+```bash
+packaging/build-deb.sh
+```
+
+It writes `dist/omen-macro_<version>_all.deb` plus a `.sha256` file. The
+package installs the app in system paths and its post-install step patches and
+rebuilds the DKMS module, so the `hp-omen-extra` package has to be installed on
+the machine where it is installed. See [packaging/README.md](../packaging/README.md)
+for what the maintainer scripts do.
+
 ## UI style
 
 The window is styled after HP's OMEN Gaming Hub. All colours come from the

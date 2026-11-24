@@ -21,7 +21,17 @@ what each one types.
 You need Ubuntu on an HP OMEN laptop, and the `hp-omen-extra` driver package
 (it is usually already there).
 
-**Get the code.** Download the latest release and unzip it:
+**Fastest way: use the .deb package.** On the
+[latest release](https://github.com/clayleopardlabs/omen-macro/releases/latest)
+page, download `omen-macro_1.0.0_all.deb`, then:
+
+```bash
+sudo apt install ./omen-macro_1.0.0_all.deb
+```
+
+It installs the app and builds the kernel module for you.
+
+**From the source archive.** Download the latest release and unzip it:
 
 [Download the latest release](https://github.com/clayleopardlabs/omen-macro/releases/latest)
 
@@ -72,6 +82,9 @@ Every change is saved and sent to the keyboard immediately. Full walkthrough:
 sudo ./install-userspace.sh   # update only the app: no rebuild, no reboot
 sudo ./revert.sh              # remove everything (profiles are kept)
 ```
+
+Installed the `.deb`? Remove it with `sudo apt remove omen-macro`. Add
+`sudo apt purge omen-macro` to delete your profiles too.
 
 ## More documents
 

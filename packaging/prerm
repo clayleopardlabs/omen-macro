@@ -1,0 +1,14 @@
+#!/bin/bash
+# prerm for omen-macro: stop the boot service and restore the stock driver.
+set -u
+
+if [ "${1:-}" = "remove" ] || [ "${1:-}" = "deconfigure" ]; then
+	systemctl stop omen-macro-apply.service >/dev/null 2>&1 || true
+	systemctl disable omen-macro-apply.service >/dev/null 2>&1 || true
+	if [ -x /usr/lib/omen-macro/kernel-teardown.sh ]; then
+		/usr/lib/omen-macro/kernel-teardown.sh \
+			|| printf '\nWARNING: the original driver may not be fully restored.\n' >&2
+	fi
+fi
+
+exit 0

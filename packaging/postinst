@@ -1,0 +1,64 @@
+#!/bin/bash
+# postinst for omen-macro.
+#
+# Installs the group and config directory, then patches and rebuilds the
+# hp-wmi driver from the hp-omen-extra DKMS package, loads it and sends the
+# active profile.  A failure in the kernel step never fails the package
+# install: the app is usable as soon as the module side is fixed, and the
+# messages say what to do.
+set -u
+
+PKG="omen-macro"
+DOC="/usr/share/doc/${PKG}"
+
+say() { printf '\n==> %s\n' "$*"; }
+warn() { printf '\nWARNING: %s\n' "$*" >&2; }
+
+if [ "${1:-}" = "configure" ]; then
+	say "Setting up the omen-hw group and config directory"
+	getent group omen-hw >/dev/null 2>&1 \
+		|| groupadd --system omen-hw >/dev/null 2>&1 \
+		|| warn "could not create the omen-hw group"
+	install -d -g omen-hw -m 2775 /etc/omen-macro 2>/dev/null \
+		|| install -d /etc/omen-macro
+
+	# The desktop user who ran apt/sudo, so the app can write the table
+	# without root.  The group takes effect after the next login.
+	if [ -n "${SUDO_USER:-}" ] && id "${SUDO_USER}" >/dev/null 2>&1; then
+		if ! id -nG "${SUDO_USER}" | tr ' ' '\n' | grep -qx omen-hw; then
+			if usermod -aG omen-hw "${SUDO_USER}" >/dev/null 2>&1; then
+				echo "Added ${SUDO_USER} to the omen-hw group."
+				echo "Log out and back in once for the app to use it."
+			fi
+		fi
+	fi
+
+	systemctl daemon-reload >/dev/null 2>&1 || true
+	systemctl enable omen-macro-apply.service >/dev/null 2>&1 || true
+	udevadm control --reload-rules >/dev/null 2>&1 || true
+
+	if [ -x /usr/lib/omen-macro/kernel-setup.sh ]; then
+		say "Setting up the kernel module"
+		/usr/lib/omen-macro/kernel-setup.sh \
+			|| warn "the kernel module step did not finish. See the messages above."
+	fi
+
+	systemctl restart omen-macro-apply.service >/dev/null 2>&1 || true
+
+	cat <<MSG
+
+OMEN Macro Keys is installed.
+
+  * Press P1 in a text editor. It should type a numpad 1.
+  * Check the whole chain:   sudo omen-macro-verify
+  * Documentation:           ${DOC}/README.md
+
+Secure Boot enabled? The keys stay dead until the module signing key is
+enrolled once. See ${DOC}/docs/SECURE-BOOT.md
+
+If the keys do nothing, reboot once. The boot service sends the profile
+again. Still nothing? Run:  sudo omen-macro-verify
+MSG
+fi
+
+exit 0

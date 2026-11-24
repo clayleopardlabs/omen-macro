@@ -1,0 +1,12 @@
+#!/bin/bash
+# postrm for omen-macro: refresh the daemons, drop the config on purge.
+set -u
+
+if [ "${1:-}" = "purge" ]; then
+	rm -rf /etc/omen-macro
+fi
+
+systemctl daemon-reload >/dev/null 2>&1 || true
+udevadm control --reload-rules >/dev/null 2>&1 || true
+
+exit 0
