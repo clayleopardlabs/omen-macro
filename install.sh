@@ -103,14 +103,23 @@ chmod 0444 "${SYSFS}/macro_status" 2>/dev/null || true
 # script stop instead of printing a success message that would be wrong.
 MOK_DER="/var/lib/shim-signed/mok/MOK.der"
 MOK_CN="Omen Secure Boot Module Signature key"
-if command -v mokutil >/dev/null && mokutil --sb-state 2>/dev/null | grep -q 'SecureBoot enabled'; then
+# Capture command output and match in the shell: `mokutil ... | grep -q` can
+# miss a match under pipefail when grep exits before mokutil finished writing.
+SB_STATE=""
+if command -v mokutil >/dev/null 2>&1; then
+	SB_STATE="$(mokutil --sb-state 2>/dev/null || true)"
+fi
+if [[ "${SB_STATE}" == *"SecureBoot enabled"* ]]; then
 	say "Secure Boot is enabled - checking the DKMS signing key"
 	if [[ -f "${MOK_DER}" ]] && command -v openssl >/dev/null; then
 		_CN="$(openssl x509 -inform DER -in "${MOK_DER}" -noout -subject 2>/dev/null \
 			| sed -n 's/^subject=.*CN *= *//p' || true)"
 		if [[ -n "${_CN}" ]]; then MOK_CN="${_CN}"; fi
 	fi
-	if [[ -f "${MOK_DER}" ]] && mokutil --list-enrolled 2>/dev/null | grep -qF -- "${MOK_CN}"; then
+	MOK_LIST="$(mokutil --list-enrolled 2>/dev/null || true)"
+	MOK_TESTKEY="$(mokutil --test-key "${MOK_DER}" 2>/dev/null || true)"
+	if [[ -f "${MOK_DER}" ]] \
+		&& { grep -qF -- "${MOK_CN}" <<<"${MOK_LIST}" || [[ "${MOK_TESTKEY}" == *"is already enrolled"* ]]; }; then
 		echo "  MOK key '${MOK_CN}' is enrolled"
 	else
 		SB_BLOCKED=1

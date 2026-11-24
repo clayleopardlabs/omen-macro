@@ -83,11 +83,22 @@ else
 fi
 
 if command -v mokutil >/dev/null 2>&1; then
-	if mokutil --list-new 2>/dev/null | grep -qF -- "${MOK_CN}"; then
+	# Read each list once and match in the shell instead of piping into
+	# `grep -q`: with pipefail a grep that exits before mokutil has finished
+	# writing turns a successful match into a false "not enrolled" (seen right
+	# after a boot).  --test-key is an independent answer to the same question
+	# and also covers the case where the list itself cannot be read yet.
+	MOK_PENDING="$(mokutil --list-new 2>/dev/null || true)"
+	MOK_ENROLLED="$(mokutil --list-enrolled 2>/dev/null || true)"
+	MOK_TESTKEY="$(mokutil --test-key "${MOK_DER}" 2>/dev/null || true)"
+	if grep -qF -- "${MOK_CN}" <<<"${MOK_PENDING}"; then
 		fail "an MOK enrolment is pending - reboot and confirm it in the blue MOK screen (Enroll MOK -> ...)" "MOK key enrolled"
-	elif mokutil --list-enrolled 2>/dev/null | grep -qF -- "${MOK_CN}"; then
+	elif grep -qF -- "${MOK_CN}" <<<"${MOK_ENROLLED}" \
+		|| [[ "${MOK_TESTKEY}" == *"is already enrolled"* ]]; then
 		MOK_OK=1
 		ok "the DKMS key is enrolled in shim's MOK list"
+	elif [[ -z "${MOK_ENROLLED//[[:space:]]/}" && "${MOK_TESTKEY}" != *"is not enrolled"* ]]; then
+		warn "cannot read the MOK list right now - re-run this check in a moment"
 	elif [[ ${SB_ENABLED} -eq 1 ]]; then
 		fail "the DKMS key is NOT enrolled, so the kernel rejects hp_wmi (\"Key was rejected by service\")" "MOK key enrolled"
 		echo "       fix: sudo ./fix-secureboot.sh   (then confirm the blue MOK screen at reboot)"

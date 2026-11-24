@@ -76,7 +76,14 @@ mok_serial() {
 # subject, so a CN substring match is enough and also survives a re-issue of
 # the certificate with the same name.
 key_enrolled() {
-	mokutil --list-enrolled 2>/dev/null | grep -qiF -- "${CN}"
+	local list testkey
+	# Capture first: `mokutil | grep -q` can turn a match into a false negative
+	# under pipefail when grep exits before mokutil finished writing.  Ask
+	# --test-key as an independent second source.
+	list="$(mokutil --list-enrolled 2>/dev/null || true)"
+	grep -qiF -- "${CN}" <<<"${list}" && return 0
+	testkey="$(mokutil --test-key "${MOK_DER}" 2>/dev/null || true)"
+	[[ "${testkey}" == *"is already enrolled"* ]]
 }
 
 # Print the post-reboot enrolment steps.  Deliberately concrete: the shim menu
@@ -284,7 +291,9 @@ if key_enrolled; then
 fi
 
 # ------------------------------- Secure Boot on, key missing: stage the enrolment
-if mokutil --list-new 2>/dev/null | grep -qiF -- "${CN}"; then
+# Capture the list first: piping mokutil into `grep -q` is unreliable under
+# pipefail (grep may exit before mokutil finishes writing).
+if grep -qiF -- "${CN}" <<<"$(mokutil --list-new 2>/dev/null || true)"; then
 	ok "an enrolment request for '${CN}' is already staged"
 else
 	if [[ ! -t 0 ]]; then
