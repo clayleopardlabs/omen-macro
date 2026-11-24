@@ -17,10 +17,22 @@ what each one types.
 ## Install
 
 You need Ubuntu on an HP OMEN laptop, and the `hp-omen-extra` driver package
-(it is usually already there). Then:
+(it is usually already there).
+
+**Get the code.** Download the latest release and unzip it:
+
+[Download the latest release](https://github.com/clayleopardlabs/omen-macro/releases/latest)
+
+Or clone the repository if you have git:
 
 ```bash
+git clone https://github.com/clayleopardlabs/omen-macro.git
 cd omen-macro
+```
+
+**Install.** Open a terminal in the folder that contains `install.sh`:
+
+```bash
 sudo ./install.sh
 ```
 

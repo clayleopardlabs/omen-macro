@@ -9,8 +9,23 @@
 
 ## Install
 
+### 1. Get the code
+
+Use the latest GitHub release (no git needed):
+
+[Download the latest release](https://github.com/clayleopardlabs/omen-macro/releases/latest)
+and unzip it, or clone the repository:
+
 ```bash
+git clone https://github.com/clayleopardlabs/omen-macro.git
 cd omen-macro
+```
+
+### 2. Run the installer
+
+Open a terminal in the folder that contains `install.sh`:
+
+```bash
 sudo ./install.sh
 ```
 
