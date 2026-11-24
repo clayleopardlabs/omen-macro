@@ -272,6 +272,43 @@ button.destructive-action label,
     color: $text_dim;
     font-size: 12px;
 }
+/* Compact syntax reference used under the editor's STEPS heading. */
+.syntax-help {
+    color: $text_dim;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    padding: 2px 6px;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 1.4px;
+    box-shadow: none;
+}
+.syntax-help:hover {
+    color: $text;
+    background-color: $surface_hover;
+}
+.syntax-help:checked,
+.syntax-help:checked:hover {
+    color: $text;
+    background-color: $surface_hover;
+}
+.syntax-sample {
+    font-family: $mono;
+    font-size: 11px;
+    color: $text;
+    background-color: $surface_hover;
+    border: 1px solid $border;
+    border-radius: 4px;
+    padding: 1px 6px;
+}
+.syntax-desc {
+    color: $text_dim;
+    font-size: 11px;
+}
+.syntax-panel {
+    border-bottom: 1px solid $border;
+}
 .page-title {
     color: $text;
     font-size: 19px;
@@ -2590,22 +2627,63 @@ class MacroWindow(Gtk.ApplicationWindow):
         # Delete).  Only this outer container and the labels around it change.
         outer = self._dialog_body()
 
+        heading_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         heading = Gtk.Label(label="STEPS", xalign=0)
         heading.add_css_class("dialog-heading")
-        outer.append(heading)
+        heading.set_hexpand(True)
+        heading_row.append(heading)
+
+        # The spelling rules are one click away; the visible line stays short
+        # so the dialog opens on the steps instead of on a paragraph.  The
+        # reference panel sits below the hint and spans the dialog width, which
+        # keeps the heading row to a single line when it opens.
+        help_btn = Gtk.ToggleButton(label="SYNTAX HELP")
+        help_btn.add_css_class("syntax-help")
+        help_btn.set_tooltip_text(
+            "How to write steps, chords and literal text")
+        help_btn.set_halign(Gtk.Align.END)
+        help_btn.set_valign(Gtk.Align.CENTER)
+        heading_row.append(help_btn)
+        outer.append(heading_row)
+
         hint = Gtk.Label(xalign=0)
         hint.set_wrap(True)
         hint.add_css_class("hint")
         hint.set_text(
-            "One row is one step: the keys the EC presses together. Join keys "
-            "with + (Ctrl+Shift+t); a space or comma separates steps "
-            "(h e = h then e). Wrap text in \"double quotes\" to type it "
-            "literally (\"Hi!\" = Shift+h, i, Shift+1). Key names ignore "
-            "case: Ctrl, Shift, Alt, Super, Enter, Space, KP_1 ... Recorded "
-            "two keys as one chord by mistake? Press Split to turn h+e into "
-            "two steps."
+            "Each row is one step (keys pressed together). "
+            "Fix a wrong chord with Split."
         )
         outer.append(hint)
+
+        syntax_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        syntax_panel.add_css_class("syntax-panel")
+        syntax_grid = Gtk.Grid(column_spacing=10, row_spacing=5)
+        syntax_grid.set_margin_top(6)
+        syntax_grid.set_margin_bottom(8)
+        syntax_grid.set_margin_start(2)
+        for row_index, (sample, description) in enumerate((
+            ("Ctrl+Shift+t", "one step: the keys pressed together"),
+            ("h e  or  h, e", "two steps in order: h, then e"),
+            ('"Hi!"', "literal text: Shift+h, i, Shift+1"),
+            ("Ctrl  Enter  KP_1", "key names, case-insensitive"),
+        )):
+            example = Gtk.Label(label=sample, xalign=0)
+            example.add_css_class("syntax-sample")
+            example.set_selectable(True)
+            explanation = Gtk.Label(label=description, xalign=0)
+            explanation.add_css_class("syntax-desc")
+            explanation.set_hexpand(True)
+            syntax_grid.attach(example, 0, row_index, 1, 1)
+            syntax_grid.attach(explanation, 1, row_index, 1, 1)
+        syntax_panel.append(syntax_grid)
+        syntax_panel.set_visible(False)
+        def toggle_help(btn: Gtk.ToggleButton) -> None:
+            active = btn.get_active()
+            syntax_panel.set_visible(active)
+            btn.set_label("HIDE HELP" if active else "SYNTAX HELP")
+
+        help_btn.connect("toggled", toggle_help)
+        outer.append(syntax_panel)
 
         steps_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         scroller = Gtk.ScrolledWindow()
