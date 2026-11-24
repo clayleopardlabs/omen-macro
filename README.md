@@ -1,406 +1,79 @@
-# OMEN macro keys (P1-P6) on Linux
+# OMEN Macro Keys
 
-Makes the six macro keys on the left edge of an HP OMEN 17 keyboard work in
-Ubuntu, with a GUI to record and edit your own macros.
+Make the six macro keys (P1–P6) on an HP OMEN laptop work on Linux, and choose
+what each one types.
 
-Developed and tested against **HP OMEN 17-ck2xxx** (DMI board `8BAD`),
-Ubuntu 26.04, kernel 7.0.0-43, with the `hp-omen-extra` 2.1.2 DKMS package.
+<img src="screenshot.webp" width="760" alt="OMEN Macro Keys window">
 
----
+## What it does
 
-## Why the keys don't work out of the box
-
-The P-keys are **not** connected to the keyboard controller. The embedded
-controller (EC) keeps a 4096-byte table of PS/2 scan-code sequences; when you
-press a P-key the EC replays the sequence stored in its slot. Until that table
-is written, a P-key press produces **no input event at all** - so no userspace
-remapper (`keyd`, `xbindkeys`, OMEN Space, …) can ever bind them.
-
-HP's Windows *OMEN Gaming Hub* fills the table through two ACPI/WMI queries and
-then enables the engine. That was reverse engineered by Lan Tian in 2022
-([write-up](https://lantian.pub/en/article/modify-computer/reverse-engineered-linux-driver-for-hp-omen-macro-keys.lantian/),
-[code](https://github.com/xddxdd/hp-omen-linux-module)); the technique was
-carried forward to kernel 7.0 by
-[FamleeX/hp-omen-cm2047nr](https://github.com/FamleeX/hp-omen-cm2047nr) on
-board `8BB0`, which sits in the same OMEN Command Center device-list entry
-(`"Cybug" / "OMEN 17"`, SSID `8BAD`) as this machine.
-
-| Approach | Works on 8BAD? |
-|---|---|
-| Mainline `hp-wmi` | no macro support at all |
-| `pelrun/hp-omen-linux-module` | RGB/keyboard backlight only, [issue #18](https://github.com/pelrun/hp-omen-linux-module/issues/18) still open |
-| OMEN Space / `hp-omen-extra` | RGB + fan + thermal only; its "macro" is a passive evdev listener for the OMEN key |
-| `sa4zet/hp.omen.kernel.patch` | macro code, but old kernels (6.8-6.10) |
-| **this project** | ports the published technique onto the DKMS driver you already run, adds a writable interface + GUI |
-
----
-
-## What gets installed
-
-### Kernel side - `kernel/hp-wmi-macro.patch`
-
-Adds to `hp-wmi` (the DKMS module in `/usr/src/hp-omen-extra-2.1.2`):
-
-| sysfs file | mode | purpose |
-|---|---|---|
-| `/sys/devices/platform/hp-wmi/macro_profile` | write-only, 4096 B | write the whole table; the write uploads it (WMI query 15) and enables the engine (query 23) |
-| `/sys/devices/platform/hp-wmi/macro_status` | read-only | last WMI return codes: `profile_write_ret`, `mode_set_ret`, `applied` |
-
-The driver does no encoding; it just transports the buffer. That keeps all
-policy in userspace where it can be edited without rebuilding a module.
-
-### Userspace - `omen_macro/`
-
-* `codec.py` - scan-code table, chord/delay encoder, profile builder, decoder
-  for UI summaries. Pure stdlib, unit-tested.
-* `apply.py` - CLI: upload the active profile, one named profile, the stock
-  numpad layout, or a blank table; `--list-profiles`, `--dry-run`, `--status`.
-* `gui.py` - GTK4 app ("OMEN Macro Keys") with key recording, per-key macros
-  and commands, named profiles, optional auto-switch, and EC status readout.
-  Styled after HP's OMEN Gaming Hub (dark chassis, branded title bar, sidebar,
-  cards); the palette lives in a `THEME` dict at the top of the file.
-* `../desktop/omen-macro.svg` - the OMEN app icon, installed into the hicolor
-  icon theme so the app grid entry matches the window.
-* `profiles.py` - named-profile store shared by the GUI, the CLI and the
-  boot service (`profiles/<name>.json` plus an `active-profile` pointer).
-* `auto_switch.py` - optional per-user daemon: switches profiles with the
-  focused app. Off unless enabled in the GUI.
-* `ec.py` - the 4096-byte EC upload helper both upload paths share.
-
-### Table format (for anyone extending this)
-
-30 slots in EC order: `P1…P6`, `Ctrl+P1…P6`, `Alt+P1…P6`, `Shift+P1…P6`,
-`Fn+P1…P6`, then one extra `0x01`. Each slot is `[len][bytes…]` where `len`
-counts itself, an unused slot is the single byte `0x01`, release codes are
-`make | 0x80`, `0xFF,ms` is a delay, and extended keys carry a `0xE0` prefix.
-The stock layout maps `P1…P6` to numpad `1…6`.
-
----
+* **Turns the six side keys into normal keys** that can type anything.
+* **Record a macro** by pressing the keys you want.
+* **Fix a macro by hand** when recording gets a step wrong — no need to start
+  over.
+* **Run a command instead of typing**, per key.
+* **Keep several profiles** and switch them automatically with the focused app.
 
 ## Install
+
+You need Ubuntu on an HP OMEN laptop, and the `hp-omen-extra` driver package
+(it is usually already there). Then:
 
 ```bash
 cd omen-macro
 sudo ./install.sh
 ```
 
-The installer backs up `hp-wmi.c`, patches it, rebuilds/reinstalls the DKMS
-package, reloads `hp_wmi`, installs the userspace tools, adds the udev rule,
-the boot service and the (opt-in) per-user auto-switch service, and uploads
-the active profile. First run seeds a Default numpad profile, migrating a
-legacy `profile.json` if you have one.
+It takes a few minutes because it builds a kernel module. Afterwards press
+`P1` — it should type a numpad `1`.
 
-**Verify:** press `P1` - it should type a numpad `1`. Or:
-
-```bash
-sudo libinput debug-events --show-keycodes # expect KEY_KP1
-omen-macro-apply --status # expect applied=1
-sudo ./verify.sh # full check, including Secure Boot and the boot service
-```
-
-**Updating only the app** (after a code change - no DKMS build, no module
-reload, no reboot; the macro keys keep working):
-
-```bash
-sudo ./install-userspace.sh
-# then close and reopen the "OMEN Macro Keys" window
-```
-
-**If nothing happens:** reboot once (the old module may have still been
-resident during the first upload) and check `omen-macro-apply --status`. If the
-GUI banner still starts with *hardware interface not found* and Secure Boot is
-on, see [Secure Boot](#secure-boot) - the module is built and signed
-correctly, only its key has not been enrolled yet.
-
-`sudo ./install.sh` is safe to re-run. To repair only a Secure Boot rejection,
-without touching DKMS, use `sudo ./fix-secureboot.sh`:
-
-```bash
-sudo ./fix-secureboot.sh # check/enrol the DKMS key, reload, restart the service
-```
-
-### Secure Boot
-
-Ubuntu only accepts a kernel module signed by a key it trusts - on a Secure
-Boot machine that means the platform keyring plus shim's MOK list. DKMS signs
-the patched `hp_wmi` with this machine's own MOK key,
-`/var/lib/shim-signed/mok/MOK.der` (`CN=Omen Secure Boot Module Signature key`),
-but that key is **not** in shim's MOK list until you enrol it once. Until then
-every boot logs
-
-```
-modprobe: ERROR: could not insert 'hp_wmi': Key was rejected by service
-```
-
-and `macro_profile` never appears, so the GUI banner starts with *hardware
-interface not found* (it names the reason next to it) and `omen-macro-apply`
-exits with code 3. Nothing is wrong with the driver - it is built, patched and
-signed; only the enrolment is missing. No rebuild is needed, and
-`hp_omen_extra` (fan/thermal) fails the same way for the same reason.
-
-Enrol the key once:
-
-```bash
-cd omen-macro
-sudo ./fix-secureboot.sh # stages the enrolment, prints the steps below
-sudo reboot
-```
-
-At the blue **MOK management** screen that appears before the Ubuntu boot
-screen (it only appears when an enrolment is pending):
-
-1. `Enroll MOK`
-2. `View key` - it must read `CN=Omen Secure Boot Module Signature key`
-3. `Continue`, then `Yes`
-4. type the one-time password you chose when `fix-secureboot.sh` ran
-5. `Reboot`
-
-Do **not** pick `Continue boot` (the first entry): it skips the enrolment, the
-module stays rejected, and you have to start over. The password is not stored
-anywhere and only unlocks this one enrolment.
-
-After that boot nothing else is needed: `hp_wmi` loads by itself and
-`omen-macro-apply.service` uploads the active profile as usual. Confirm with
-`sudo ./verify.sh` or by pressing `P1`.
-
-`fix-secureboot.sh` is safe to re-run and idempotent. It only checks the
-signature, refreshes the userspace files from the repo, reinstalls the udev
-rule and restarts the boot service. It never rebuilds DKMS, edits kernel
-sources, changes firmware/BIOS settings or uses the network. It exits `0` when
-the keys work immediately, `10` when a reboot is required to confirm the
-enrolment, and `1` on a failed precondition (the message says which).
-
-Out of scope but worth knowing: if `modinfo -F signer hp_wmi` prints nothing
-the module is not signed at all - reinstall `hp-omen-extra` so DKMS signs it
-again before enrolling anything, otherwise enrolling the key cannot help.
-
-**Keep Secure Boot on, or turn it off?** Keeping it on is the recommended path:
-the key is enrolled for this machine only, it does not vouch for arbitrary
-modules, and Windows keeps its own Secure Boot state (on this laptop Windows
-re-enabled Secure Boot as an overheating workaround, which is what broke the
-macro keys). Disabling Secure Boot in the BIOS/UEFI setup also makes the module
-load (unsigned), but the keys die again the moment Secure Boot is re-enabled,
-and a Windows or firmware update may re-enable it for you.
-
+* **Secure Boot is on?** The keys will stay dead until you do one extra
+  two-minute step: [Secure Boot](docs/SECURE-BOOT.md).
+* **Nothing happens?** Reboot once, then read
+  [Troubleshooting](docs/TROUBLESHOOTING.md).
+* **Want the details?** [Install guide](docs/INSTALL.md).
 
 ## Use
 
 ```bash
-omen-macro # GUI (also "OMEN Macro Keys" in the app grid)
+omen-macro
 ```
 
-![OMEN Macro Keys GUI](screenshot.webp)
+The window is also in the app grid as **OMEN Macro Keys**.
 
-The window follows HP's OMEN Gaming Hub look: near-black chassis, a branded
-title bar, an icon sidebar switching between **Macros** and **Auto-switch**,
-card panels with uppercase section headers, and OMEN red for the brand and the
-primary actions. It pins its own Adwaita dark base for the process (unless you
-run a HighContrast theme), so it looks the same whatever desktop theme you use.
+* Click **Record**, press the keys, click **Stop**.
+* Click **Edit** to fix one step of a macro (a typo, or two keys that were
+  recorded as one). Press **Split** to turn `h+e` into `h` then `e`.
+* Use the profile box in the title bar to add, rename or switch profiles.
+* Click **Cmd** to run a program when a key is pressed instead of typing.
+* The **Auto-switch** page can change profile when you change apps (off by
+  default).
 
-Click **Record** on a key, type the sequence, press **Stop**. Recording
-captures *key order only*; the "Spacing between key presses" spinbox sets the
-delay inserted between keystrokes when the EC replays them. **Every change
-saves the current profile and sends it to the keyboard immediately** - there
-is no separate save step, and the boot service re-applies the active profile
-after a restart.
+Every change is saved and sent to the keyboard immediately. Full walkthrough:
+[Using the app](docs/USING-THE-APP.md).
 
-Some shortcuts cannot be recorded live: the desktop grabs them first (the
-classic case is Ctrl+Alt+T, which opens a terminal and steals focus before
-the T reaches the window). For those, use the **Keys** button on the row to
-tick modifiers and pick the key by hand; what you compose is exactly what the
-EC will replay.
-
-### Editing a macro by hand
-
-Recording cannot tell "pressed together" from "pressed a moment too soon", so
-a fast sequence sometimes lands as one chord (`h` and `e` stored as `h+e`).
-Every P-key row has an **Edit** button that opens the macro one step per line,
-so you can repair that step instead of recording the whole macro again:
-
-- One row is one **step** - the keys the EC presses together. `h+e` is h and e
-  at the same time; `h e` or `h,e` is h then e. To fix the mis-detected chord
-  press **Split** on that row (it becomes `h`, `e`), or just retype the row.
-- **Insert** adds an empty step after a row, **Delete** removes a row and
-  **Add step** appends one at the end. Text you have typed but not yet applied
-  is kept when you split/insert/delete.
-- A row may hold several steps at once: typing `h e l l o` in one row gives
-  five sequential steps.
-- Wrap text in double quotes to type it literally: `"Hi, you"` becomes
-  Shift+h, i, comma, space, y, o, u. Uppercase letters and shifted symbols
-  (`!`, `?`, `:` ...) get Shift automatically (US layout).
-- Key names ignore case and accept the names the window shows plus the common
-  spellings: `Ctrl`, `Shift`, `Alt`, `Super`, `Enter`, `Esc`, `Space`, `Tab`,
-  `Backspace`, `PgUp`, arrows, `KP_1`, `Num+`, or the canonical `Control_L`.
-  `+` joins a chord, so `Ctrl+Shift+t` is one step (spaces around `+` are
-  fine).
-- The line under the list previews the macro and its size against the EC's
- 254-byte budget. **OK** saves and sends it like every other change; **Reset**
-  restores the saved steps and **Cancel** closes without touching the macro.
-  If a step cannot be read the dialog says which row to fix and stays open.
-
-
-![The Edit macro dialog](screenshot-editor.webp)
-
-**Keys** is still the fastest way to compose a fixed shortcut from scratch;
-**Edit** is for taking an existing macro apart.
-
-### Profiles
-
-The profile switcher sits at the top of the window. New creates a profile as
-a copy of the current one, Rename renames it, Delete removes it (the last
-profile cannot go). Switching profiles applies that profile at once. The old
-single `profile.json`, if you have one, is imported as Default on first run.
-
-CLI equivalents:
+## Update or remove
 
 ```bash
-omen-macro-apply # upload the active profile
-omen-macro-apply --profile Gaming # upload one profile without switching
-omen-macro-apply --list-profiles # show profiles (* marks the active one)
-omen-macro-apply --default # stock numpad layout
-omen-macro-apply --clear # all slots empty
-omen-macro-apply --dry-run # encode + summarise, touch nothing
+sudo ./install-userspace.sh   # update only the app: no rebuild, no reboot
+sudo ./revert.sh              # remove everything (profiles are kept)
 ```
 
-### Per-key commands (run a program instead of typing)
+## More documents
 
-Every P-key row and the OMEN row have a command option alongside the macro:
-
-- P1-P6: the Cmd button binds KP_1-KP_6 to any command you type. While a
-  command is set, that key's typing macro is left out of the EC upload, so the
-  key runs the command instead of typing. Fn+P combinations still replay their
-  own slots. Note: a USB keyboard with a real numpad sends the same keysyms,
-  so it would also trigger these shortcuts.
-- OMEN (logo key): the logo key is not an EC macro slot. It always sends
-  KEY_PROG2 (XF86Launch2), so there is nothing to upload. Set opens a dialog
-  for the command it should run (default `omen-macro`), Clear removes the
-  shortcut.
-
-The GUI owns one GNOME custom shortcut per configured key and leaves your
-other shortcuts alone. Commands live in the profile under `commands` and
-survive reboot like the macros. Older files using `omen_key` still load.
-
-### What the buttons do
-
-The footer buttons are deliberately few: everything else applies itself.
-
-- Re-apply: re-sends the current profile to the keyboard and shortcuts
-  (recovery if the keys stop responding).
-- Load defaults: replaces this window with the stock numpad layout, saved
-  and sent immediately.
-
-### Auto-switch profiles (optional, off by default)
-
-A per-user background service watches the focused app and switches profiles
-for you - for example a Gaming profile while a game is focused, back to
-Default otherwise. Matching is a case-insensitive substring of the app name
-and window title; the first rule wins. Your manual switches always win until
-focus moves again: the daemon only acts when the focused *application*
-changes.
-
-Set it up in the GUI under "Auto-switch profiles": flip the switch on, add
-rules (app text plus profile), pick the fallback profile for when nothing
-matches, and use Refresh to see what the daemon currently sees focused. The
-service logs to the journal:
-
-```bash
-journalctl --user -u omen-macro-auto.service
-```
-
-It needs a running desktop with accessibility services (standard on GNOME)
-and does nothing when they are unavailable.
-
-## Limitations
-
-* The EC replays **PS/2 scan code set 1**. Keys without such a code cannot be
-  emitted: `F13`-`F24`, media/volume/brightness keys, and most
- `XF86…` keys. The GUI reports these instead of silently dropping them.
-* One entry may hold at most 254 payload bytes - roughly 60 keystrokes,
- less with delays.
-* Spacing is 0-2040 ms (the EC's delay marker is one byte, so it is split into
- 255 ms chunks).
-* The EC forgets the table on a cold boot, hence the systemd oneshot service.
-* Modifier variants (`Ctrl+P1`, …) are separate EC slots. If they are left
- empty, pressing e.g. `Ctrl+P1` does whatever the base `P1` macro does with
- Ctrl held.
-
-## Revert
-
-```bash
-sudo ./revert.sh
-```
-
-Clears the EC table, restores the backed-up `hp-wmi.c`, rebuilds the DKMS
-module, and removes the udev rule, services and installed binaries. The config
-directory (`/etc/omen-macro`) is kept.
-
-It does not withdraw the enrolled MOK key: the key alone is harmless (it only
-vouches for modules DKMS signs on this machine), and removing it needs another
-confirmation in the blue MOK screen (`sudo mokutil --delete /var/lib/shim-signed/mok/MOK.der`,
-then reboot).
-
-## Troubleshooting
-
-| Symptom | Cause / fix |
+| Document | What is in it |
 |---|---|
-| `modprobe: ERROR: could not insert 'hp_wmi': Key was rejected by service` | Secure Boot is on and the DKMS key is not enrolled - `sudo ./fix-secureboot.sh`, then confirm the blue MOK screen at the next boot. See [Secure Boot](#secure-boot) |
-| GUI banner starts with `hardware interface not found` (or `omen-macro-apply` exits 3) | the patched module is not loaded - the banner names the reason. With Secure Boot on it is usually the missing MOK enrolment above; otherwise run `sudo ./install.sh`, or reboot if a rebuild just happened |
-| `macro_profile` missing | patched module not loaded - `dmesg \| grep macro`, `sudo ./verify.sh`, or reboot. Check `modinfo -F signer hp_wmi` and [Secure Boot](#secure-boot) first |
-| `permission denied` writing | udev rule/permissions - `sudo ./fix-boot.sh`, or `sudo chmod 0220 …` |
-| `macro_status` shows non-zero `profile_write_ret` | the EC rejected the upload; the keys stay disabled and nothing breaks. Report the code |
-| `ENODEV` / `EIO` on write | driver could not reach the EC via WMI (query 15 unsupported on this firmware) |
-| Keys dead after reboot, then work a minute later | the boot unit ran late. Fixed by `fix-boot.sh`; see "Boot timing" below |
-| Keys dead after reboot and stay dead | `systemctl status omen-macro-apply` / `journalctl -b -u omen-macro-apply` |
-
-### Boot timing
-
-The EC forgets the table on every cold boot, so `omen-macro-apply.service`
-re-uploads it. Two ordering pitfalls, both fixed in the shipped unit:
-
-* Do **not** put `After=multi-user.target` on it. Userspace can take minutes
- here; the driver is ready ~5 s after boot, and the keys stay dead until the
- upload happens. The unit intentionally runs as soon as `basic.target` is
- reached.
-* The `macro_profile` attribute is created in the driver's probe, which can be
- later than udev's `add` event for the platform device. A udev rule with
- `TEST=="macro_profile"` therefore silently fails, which is why the shipped
- rule waits for the file and the unit's `ExecStartPost` also fixes the group.
-
-`sudo ./fix-boot.sh` applies just those two fixes (unit + udev rule +
-permissions, no module rebuild). Re-running `install.sh` is also safe but
-slower, because it rebuilds the DKMS package.
-
-
-## Tests
-
-```bash
-python3 tests/test_codec.py # encoder format tests, no hardware needed
-python3 tests/test_editor.py # manual-editor syntax: text <-> steps, quotes, KP_Add
-python3 tests/test_profiles.py # profile store, migration, active pointer
-python3 tests/test_omen_key.py # shortcut helpers (plus a read-only live check)
-python3 tests/test_auto_switch.py # focus matcher, rules file (plus live probe)
-python3 tests/test_boot_diag.py # missing-interface diagnosis (Secure Boot etc.)
-python3 -m omen_macro.gui --selftest # recording + encoder + profiles + editor
-```
-
-The editor dialog has a real-widget smoke test too; it needs a graphical
-session, shows no window, and drives the actual Split/Insert/Delete/OK buttons:
-
-```bash
-DISPLAY=:0 python3 tests/gui_integration.py # prints SKIPPED without a display
-```
-
-The window itself is rendered offscreen by `tests/render_ui.py`: it captures
-every page and dialog to PNG (no window ever becomes visible), runs the
-palette/contrast/layout checks and writes `report.json` - useful before/after
-the styling or layout of the GUI is touched:
-
-```bash
-DISPLAY=:0 python3 tests/render_ui.py --out /tmp/omen-ui
-```
+| [Install guide](docs/INSTALL.md) | install, update, remove, files and folders |
+| [Using the app](docs/USING-THE-APP.md) | recording, editing, profiles, commands, auto-switch |
+| [Secure Boot](docs/SECURE-BOOT.md) | why the module is rejected and how to enrol the key once |
+| [Troubleshooting](docs/TROUBLESHOOTING.md) | symptoms, logs, boot timing |
+| [How it works](docs/HOW-IT-WORKS.md) | the keyboard table, kernel patch, internals |
+| [Developing](docs/DEVELOPING.md) | tests, visual QA harness, UI style |
 
 ## Credits
 
-Lan Tian (reverse engineering, write-up), `xddxdd` and `pelrun` (Linux
-driver work), `FamleeX` (kernel-7.0 forward port), `yunusemreyl` (the
+Lan Tian (reverse engineering and write-up), `xddxdd` and `pelrun` (Linux
+driver work), `FamleeX` (kernel 7.0 port), `yunusemreyl` (the
 `hp-omen-extra`/OMEN Space stack this builds on).
+
+Tested on an HP OMEN 17-ck2xxx (board `8BAD`), Ubuntu 26.04, kernel 7.0.0-43.

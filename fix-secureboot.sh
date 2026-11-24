@@ -141,6 +141,11 @@ refresh_userspace() {
 	if [[ -f "${SCRIPT_DIR}/README.md" ]] && ! cmp -s "${SCRIPT_DIR}/README.md" "${LIBDIR}/README.md"; then
 		install -m644 "${SCRIPT_DIR}/README.md" "${LIBDIR}/README.md"
 	fi
+	# Keep the docs that the README links to next to it.
+	if [[ -d "${SCRIPT_DIR}/docs" ]]; then
+		install -d "${LIBDIR}/docs"
+		install -m644 "${SCRIPT_DIR}"/docs/*.md "${LIBDIR}/docs/"
+	fi
 	if [[ ! -x /usr/local/bin/omen-macro-apply ]]; then
 		warn "no /usr/local/bin/omen-macro-apply - run sudo ./install.sh to finish the installation"
 	fi

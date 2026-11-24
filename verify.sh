@@ -223,6 +223,6 @@ if [[ ${FAILS} -eq 0 ]]; then
 	printf '\033[32mAll checks passed\033[0m - P1..P6 are working.\n'
 else
 	printf '\033[31m%d check(s) failed\033[0m: %s\n' "${FAILS}" "$(IFS=', '; echo "${FAILED_CHECKS[*]}")"
-	echo "See README.md#troubleshooting."
+	echo "See docs/TROUBLESHOOTING.md."
 fi
 exit "${FAILS}"

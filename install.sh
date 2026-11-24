@@ -132,6 +132,9 @@ say "installing userspace tools to ${LIBDIR}"
 install -d "${LIBDIR}/omen_macro"
 install -m644 "${SCRIPT_DIR}"/omen_macro/*.py "${LIBDIR}/omen_macro/"
 install -m644 "${SCRIPT_DIR}/README.md" "${LIBDIR}/README.md"
+install -m644 "${SCRIPT_DIR}"/screenshot*.webp "${LIBDIR}/"
+install -d "${LIBDIR}/docs"
+install -m644 "${SCRIPT_DIR}"/docs/*.md "${LIBDIR}/docs/"
 
 cat > /usr/local/bin/omen-macro <<'LAUNCHER'
 #!/bin/sh
