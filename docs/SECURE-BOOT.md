@@ -16,7 +16,7 @@ modprobe: ERROR: could not insert 'hp_wmi': Key was rejected by service
 ```
 
 and the app shows *hardware interface not found*. Nothing is broken: the
-module is built and signed correctly — only the enrolment is missing. No
+module is built and signed correctly. Only the enrolment is missing. No
 rebuild is needed. The fan/thermal module (`hp_omen_extra`) is signed the same
 way and is rejected for the same reason.
 
@@ -32,7 +32,7 @@ Before Ubuntu starts you get a blue **MOK management** screen. It only appears
 when an enrolment is waiting.
 
 1. Choose **Enroll MOK**
-2. Choose **View key** — it must say `CN=Omen Secure Boot Module Signature key`
+2. Choose **View key**. It must say `CN=Omen Secure Boot Module Signature key`
 3. **Continue**, then **Yes**
 4. Type the one-time password from step 1
 5. **Reboot**
@@ -65,7 +65,7 @@ That also works: an unsigned module loads when Secure Boot is off. But the keys
 die again as soon as Secure Boot is switched back on, and Windows or a firmware
 update may switch it back on for you (this is exactly what happened on the
 machine this was developed on). Keeping Secure Boot on and enrolling the key is
-the stable option — the key vouches only for modules built on this machine.
+the stable option. The key vouches only for modules built on this machine.
 
 ## If the module is not signed at all
 

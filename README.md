@@ -1,6 +1,6 @@
 # OMEN Macro Keys
 
-Make the six macro keys (P1–P6) on an HP OMEN laptop work on Linux, and choose
+Make the six macro keys (P1-P6) on an HP OMEN laptop work on Linux, and choose
 what each one types.
 
 <img src="screenshot.webp" width="760" alt="OMEN Macro Keys window">
@@ -9,7 +9,7 @@ what each one types.
 
 * **Turns the six side keys into normal keys** that can type anything.
 * **Record a macro** by pressing the keys you want.
-* **Fix a macro by hand** when recording gets a step wrong — no need to start
+* **Fix a macro by hand** when recording gets a step wrong. No need to start
   over.
 * **Run a command instead of typing**, per key.
 * **Keep several profiles** and switch them automatically with the focused app.
@@ -25,7 +25,7 @@ sudo ./install.sh
 ```
 
 It takes a few minutes because it builds a kernel module. Afterwards press
-`P1` — it should type a numpad `1`.
+`P1`. It should type a numpad `1`.
 
 * **Secure Boot is on?** The keys will stay dead until you do one extra
   two-minute step: [Secure Boot](docs/SECURE-BOOT.md).

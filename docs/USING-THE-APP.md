@@ -11,8 +11,8 @@ Every change is saved and sent to the keyboard straight away. There is no
 
 The window has two pages, picked in the left sidebar:
 
-* **Macros** – the six macro keys and their settings.
-* **Auto-switch** – optional: change profile depending on the focused app.
+* **Macros**: the six macro keys and their settings.
+* **Auto-switch**: optional: change profile depending on the focused app.
 
 The status bar at the bottom always shows what the app is doing, and the
 sidebar shows whether the keyboard accepted the last upload (`APPLIED`).
@@ -21,12 +21,12 @@ sidebar shows whether the keyboard accepted the last upload (`APPLIED`).
 
 ## Recording a macro
 
-1. Click **Record** on a key (P1–P6).
+1. Click **Record** on a key (P1-P6).
 2. Press the keys you want, in order.
 3. Click **Stop** (or press `Esc`).
 
 Recording keeps **key order only**. Keys held at the same time count as one
-"step" — so `Ctrl` then `C` becomes `Ctrl+C`, not `Ctrl` then `C`.
+"step", so `Ctrl` then `C` becomes `Ctrl+C`, not `Ctrl` then `C`.
 
 **Spacing between key presses** sets the delay the keyboard puts between
 steps, from 0 to 2040 ms. 20 ms is a good default.
@@ -43,7 +43,7 @@ Fast typing can make the app think two keys were pressed together when they
 were really one after the other. You do not need to record the macro again:
 click **Edit** on the row and fix only the step that is wrong.
 
-Each row is one **step** — the keys the keyboard presses together.
+Each row is one **step**: the keys the keyboard presses together.
 
 | You type | You get |
 |---|---|
@@ -79,9 +79,9 @@ repairing a macro that already exists.
 
 A profile is a full set of macros. Use the profile box in the title bar:
 
-* **New** – copy the current profile under a new name.
-* **Rename** – rename it.
-* **Delete** – remove it (asks first; the last profile cannot be deleted).
+* **New**: copy the current profile under a new name.
+* **Rename**: rename it.
+* **Delete**: remove it (asks first; the last profile cannot be deleted).
 
 Switching profiles sends that profile to the keyboard immediately.
 
@@ -103,28 +103,28 @@ omen-macro-apply --status           # read the last keyboard return codes
 
 Each P-key and the OMEN key can run a program instead of typing a macro.
 
-* **P1–P6** – click **Cmd** and type a command. While a command is set, that
+* **P1-P6**: click **Cmd** and type a command. While a command is set, that
   key runs the command and its typing macro is not sent to the keyboard.
   Fn+P combinations still use their own macros.
-* **OMEN key** (the logo key) – it does not use a macro slot at all. Click
+* **OMEN key** (the logo key): it does not use a macro slot at all. Click
   **Set** and type the command it should run (default: `omen-macro`).
 
 The app adds one GNOME keyboard shortcut per configured key and leaves your
 other shortcuts alone. Commands are stored in the profile, so they survive a
 reboot.
 
-> Note: a USB keyboard with a real numpad sends the same keys, so pressing its
-> `1`–`6` also triggers P-key commands.
+> Note: a USB keyboard with a real numpad sends the same keys, so its number
+> keys also trigger P-key commands.
 
 ---
 
 ## Footer buttons
 
-* **Re-apply** – send the current profile again (use this if the keys stop
+* **Re-apply**: send the current profile again (use this if the keys stop
   responding).
-* **Load defaults** – replace the profile with the stock numpad layout
+* **Load defaults**: replace the profile with the stock numpad layout
   (asks first).
-* **Stop recording** – appears only while recording.
+* **Stop recording**: appears only while recording.
 
 ---
 
@@ -156,9 +156,9 @@ When they are not available the service simply does nothing.
 ## What the keys cannot type
 
 The keyboard chip can only replay **PS/2 scan codes**, so some keys cannot be
-emitted at all: `F13`–`F24`, media/volume/brightness keys and most `XF86…`
+emitted at all: `F13` to `F24`, media/volume/brightness keys and most `XF86…`
 keys. The app tells you when a key cannot be used instead of silently dropping
-it. There is also a size limit of 254 bytes per macro — roughly 60
+it. There is also a size limit of 254 bytes per macro, roughly 60
 keystrokes, fewer with delays.
 
 See [how it works](HOW-IT-WORKS.md) for the details.

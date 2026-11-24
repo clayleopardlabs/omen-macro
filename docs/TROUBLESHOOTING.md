@@ -50,7 +50,7 @@ omen-macro-apply --status
 
 * `profile_write_ret=0` and `mode_set_ret=0` and `applied=1` is good.
 * A non-zero `profile_write_ret` means the keyboard rejected the table. Nothing
-  is damaged — the engine just stays off. Please report the code.
+  is damaged. The engine just stays off. Please report the code.
 * `ENODEV` or `EIO` while writing means the driver could not reach the keyboard
   controller (this firmware may not support WMI query 15).
 
@@ -65,7 +65,7 @@ run from a terminal shows the Python error. The app needs GTK4
 
 ## Keys type the wrong thing
 
-Open the row with **Edit** and fix the step — see
+Open the row with **Edit** and fix the step. See
 [USING-THE-APP.md](USING-THE-APP.md#editing-a-macro-by-hand). Two keys that
 were pressed one after the other sometimes get recorded as one chord; press
 **Split** on that row.

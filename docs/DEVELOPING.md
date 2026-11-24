@@ -11,6 +11,7 @@ python3 tests/test_profiles.py     # profile store and migration
 python3 tests/test_omen_key.py     # GNOME shortcut helpers
 python3 tests/test_auto_switch.py  # focus matcher and rules file
 python3 tests/test_boot_diag.py    # missing-interface diagnosis
+python3 tests/test_style.py        # no em-dashes in docs or code
 python3 -m omen_macro.gui --selftest   # recorder, encoder, profiles, editor
 ```
 
@@ -48,10 +49,10 @@ instead.
 
 The key names and their PS/2 scan codes live in `omen_macro/codec.py`:
 
-* `_PLAIN` – normal keys (scan code without a prefix);
-* `_EXTENDED` – keys that need the `0xE0` prefix;
-* `ALIASES` – alternative spellings;
-* `PRETTY` – names shown in the app.
+* `_PLAIN`: normal keys (scan code without a prefix);
+* `_EXTENDED`: keys that need the `0xE0` prefix;
+* `ALIASES`: alternative spellings;
+* `PRETTY`: names shown in the app.
 
 A key that has no entry there cannot be replayed by the keyboard chip, so the
 app will refuse it rather than silently dropping it.

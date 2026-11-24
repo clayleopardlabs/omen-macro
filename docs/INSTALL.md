@@ -3,7 +3,7 @@
 ## Before you start
 
 * Ubuntu (tested on 26.04, kernel 7.0.0-43) on an HP OMEN laptop.
-* The `hp-omen-extra` DKMS package installed — it provides the `hp-wmi`
+* The `hp-omen-extra` DKMS package installed. It provides the `hp-wmi`
   driver that this project patches. On this laptop it is version 2.1.2.
 * `sudo` (the installer needs root to build a kernel module).
 
@@ -23,7 +23,7 @@ It takes a few minutes. The installer:
 5. sends the default profile to the keyboard.
 
 The first run creates a **Default** profile with the stock numpad layout
-(`P1`–`P6` type numpad `1`–`6`). If you have an old `profile.json`, it is
+(`P1` to `P6` type numpad `1` to `6`). If you have an old `profile.json`, it is
 imported as Default.
 
 If the keys do nothing right after installing, reboot once: the old module may
@@ -31,7 +31,7 @@ still have been loaded when the first profile was sent.
 
 ### Check that it worked
 
-Press `P1` in a text editor — it should type a numpad `1`.
+Press `P1` in a text editor. It should type a numpad `1`.
 
 ```bash
 omen-macro-apply --status     # expect applied=1
@@ -73,7 +73,7 @@ This clears the keyboard table, restores the original `hp-wmi.c`, rebuilds the
 DKMS module and removes the udev rule, services, icon and installed programs.
 Your profiles in `/etc/omen-macro` are kept.
 
-The enrolled Secure Boot key is not removed — it is harmless (it only vouches
+The enrolled Secure Boot key is not removed. It is harmless (it only vouches
 for modules built on this machine). To remove it you would need another
 confirmation in the blue MOK screen:
 

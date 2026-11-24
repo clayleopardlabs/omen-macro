@@ -24,7 +24,7 @@ carried forward to kernel 7.0 by
 | Mainline `hp-wmi` | no macro support |
 | `pelrun/hp-omen-linux-module` | RGB/backlight only ([issue #18](https://github.com/pelrun/hp-omen-linux-module/issues/18)) |
 | OMEN Space / `hp-omen-extra` | RGB, fan and thermal only |
-| `sa4zet/hp.omen.kernel.patch` | macro code, but old kernels (6.8–6.10) |
+| `sa4zet/hp.omen.kernel.patch` | macro code, but old kernels (6.8 to 6.10) |
 | **this project** | ports the published technique to the DKMS driver already installed, adds a writable interface and a GUI |
 
 ## The kernel side
@@ -71,11 +71,11 @@ The stock layout maps `P1…P6` to numpad `1…6`.
 
 ## Limits
 
-* Only keys with a PS/2 scan code set 1 code can be replayed. `F13`–`F24`,
+* Only keys with a PS/2 scan code set 1 code can be replayed. `F13` to `F24`,
   media/volume/brightness keys and most `XF86…` keys are impossible.
-* One macro can hold at most 254 payload bytes — about 60 keystrokes, fewer
-  with delays.
-* Spacing is 0–2040 ms. The EC's delay marker is one byte (0–255 ms), so
+* One macro can hold at most 254 payload bytes, about 60 keystrokes (fewer
+  with delays).
+* Spacing is 0 to 2040 ms. The EC's delay marker is one byte (0 to 255 ms), so
   longer delays are sent as several markers.
 * The EC forgets the table on a cold boot; that is why a boot service sends it
   again. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for the boot timing.
