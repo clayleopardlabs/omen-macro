@@ -894,6 +894,56 @@ class Harness:
         self.gui.Gtk.Window = RenderWindow
         self.dialog_recorder = RenderWindow
 
+    def remap(self, window) -> None:
+        """Hide and re-present a window so GTK repaints its (invalidated) tree.
+
+        After a label text change GTK invalidates the widget's cached paint
+        node; on this transparent, never-composited window the node can stay
+        NULL until the toplevel is mapped again.  The window stays at opacity
+        0.01 throughout.  A recording in progress is briefly detached so the
+        window's focus-loss handler cannot add its "focus left the window"
+        banner during the remap.
+        """
+        saved_recording = getattr(window, "recording", None)
+        if saved_recording is not None:
+            try:
+                window.recording = None
+            except Exception:
+                saved_recording = None
+        try:
+            window.set_visible(False)
+            self.pump(0.06)
+            window.present()
+            self.pump(0.22)
+            self.wait_mapped(window)
+        finally:
+            if saved_recording is not None:
+                try:
+                    window.recording = saved_recording
+                except Exception:
+                    pass
+
+    def wait_mapped(self, window, timeout: float = 2.5) -> bool:
+        """Pump until the toplevel and its content child are mapped.
+
+        Pinning a toplevel size on a multi-monitor Wayland session is an async
+        handshake; under load the resize can still be in flight after the
+        normal settle time, and painting an unmapped child yields no node.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            child = None
+            try:
+                child = window.get_child()
+            except Exception:
+                child = None
+            if (window.get_mapped() and child is not None
+                    and child.get_mapped()):
+                self.pump(0.12)
+                return True
+            self.pump(0.05)
+        return False
+
     def pump(self, seconds: float | None = None) -> None:
         context = self.GLib.MainContext.default()
         deadline = time.monotonic() + (SETTLE_SECONDS if seconds is None else seconds)
@@ -928,6 +978,7 @@ class Harness:
             win.set_size_request(width, height)
             self.pump()
             forced = True
+        self.wait_mapped(win)
         win._render_requested_size = [width, height]
         win._render_size_forced = forced
         return win
@@ -1006,23 +1057,33 @@ class Harness:
         """Paint titlebar + content at their real window coordinates."""
         background = self.window_background(window)
         images = []
-        for label, widget in parts:
-            if widget is None:
-                continue
-            try:
-                if not widget.get_mapped():
+        for attempt in (0, 1):
+            if attempt:
+                self.remap(window)
+            images = []
+            failure = None
+            for label, widget in parts:
+                if widget is None:
                     continue
-                path, width, height = self._widget_png(widget)
-            except RuntimeError as exc:
-                return {"error": str(exc), "part": label}
-            try:
-                found, rect = widget.compute_bounds(window)
-                x = rect.get_x() if found else 0.0
-                y = rect.get_y() if found else 0.0
-            except Exception:
-                x = y = 0.0
-            images.append({"part": label, "path": path, "width": width,
-                           "height": height, "x": x, "y": y})
+                try:
+                    if not widget.get_mapped():
+                        self.wait_mapped(window, timeout=1.2)
+                    path, width, height = self._widget_png(widget)
+                except RuntimeError as exc:
+                    failure = (label, exc)
+                    break
+                try:
+                    found, rect = widget.compute_bounds(window)
+                    x = rect.get_x() if found else 0.0
+                    y = rect.get_y() if found else 0.0
+                except Exception:
+                    x = y = 0.0
+                images.append({"part": label, "path": path, "width": width,
+                               "height": height, "x": x, "y": y})
+            if failure is None:
+                break
+            if attempt:
+                return {"error": str(failure[1]), "part": failure[0]}
         if not images:
             return {"error": "no capturable widget (window not mapped?)"}
         width = window.get_width()
@@ -1102,6 +1163,7 @@ class Harness:
         return result
 
     def capture_dialog(self, dialog, name: str) -> dict:
+        self.wait_mapped(dialog)
         result = self._compose_window(dialog, name, self.window_parts(dialog))
         result["css_classes"] = widget_css(dialog)
         return result
@@ -1406,7 +1468,7 @@ def _scenario_dialogs(harness, width, height):
     }
     return {
         "captures": captures,
-        "analysis": analyze_png(captures[0]["path"]),
+        "analysis": analyze_png(captures[0].get("path", "")),
         "widgets": merged,
         "dialogs": dialogs,
         "notes": notes,
@@ -1533,7 +1595,7 @@ def _scenario_dialog_errors(harness, width, height):
     merged["banners"] = sum((d["widgets"].get("banners") or [] for d in dialogs), [])
     return {
         "captures": captures,
-        "analysis": analyze_png(captures[0]["path"]),
+        "analysis": analyze_png(captures[0].get("path", "")),
         "widgets": merged,
         "dialogs": dialogs,
         "notes": [f"{d['name']}: inline error capture" for d in dialogs],
@@ -1714,7 +1776,7 @@ def _scenario_pages(harness, width, height):
     checks = harness.checks(win, width, height)
     return {
         "captures": captures,
-        "analysis": analyze_png(captures[0]["path"]) if captures else None,
+        "analysis": (analyze_png(captures[0].get("path", "")) if captures else None),
         "widgets": checks,
         "notes": notes,
     }
