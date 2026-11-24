@@ -37,6 +37,8 @@ in userspace needs special privileges beyond writing the profile once.
 
 from __future__ import annotations
 
+import re
+
 SLOT_NAMES = [
     "P1", "P2", "P3", "P4", "P5", "P6",
     "Ctrl+P1", "Ctrl+P2", "Ctrl+P3", "Ctrl+P4", "Ctrl+P5", "Ctrl+P6",
@@ -302,6 +304,170 @@ def describe_entry(chords: list[list[str]]) -> str:
     if not chords:
         return "empty"
     return ", ".join(describe_chord(c) for c in chords)
+
+
+# --------------------------------------------------------------------------- #
+# Manual editing: text -> chords (and back)
+#
+# The macro data model has two levels:
+#   * a *step* (chord) is a list of keys pressed together, e.g. ["Control_L","c"]
+#   * the macro is the ordered list of steps
+#
+# The editor shows one step per field.  This parser turns what the user types
+# back into that model, so a typo can be fixed in place instead of re-recording:
+#
+#   "h"            one step, the h key
+#   "h+e"          one step, h and e pressed together (a mis-detected chord)
+#   "h e" or "h,e" two sequential steps
+#   "Ctrl+Shift+t" one chord: Ctrl, Shift and t held together
+#   '"Hi!"'        literal text: H i ! as sequential steps (Shift added
+#                  automatically; US layout for punctuation)
+#
+# Key names are case-insensitive and accept the canonical names ("Control_L",
+# "BackSpace", "KP_1"), the aliases from ALIASES and the pretty names the UI
+# prints ("Ctrl", "Enter", "PgUp", "Num+", "Space"), so a step copied out of the
+# window can be typed back unchanged.
+# --------------------------------------------------------------------------- #
+
+#: Unshifted US-layout character -> canonical key name, for `"literal text"`.
+_CHAR_KEYS = {c: c for c in "abcdefghijklmnopqrstuvwxyz0123456789"}
+_CHAR_KEYS.update({
+    "-": "minus", "=": "equal", "[": "bracketleft", "]": "bracketright",
+    "\\": "backslash", ";": "semicolon", "'": "apostrophe", "`": "grave",
+    ",": "comma", ".": "period", "/": "slash", " ": "space",
+})
+
+#: Shifted US-layout character -> canonical key name pressed with Shift.
+_SHIFTED_CHARS = {
+    "!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6", "&": "7",
+    "*": "8", "(": "9", ")": "0", "_": "minus", "+": "equal",
+    "{": "bracketleft", "}": "bracketright", "|": "backslash",
+    ":": "semicolon", '"': "apostrophe", "<": "comma", ">": "period",
+    "?": "slash", "~": "grave",
+}
+
+#: Case-insensitive name -> canonical key.  Built from the tables above plus a
+#: few obvious spellings people actually type.
+_NAME_LOOKUP: dict[str, str] = {}
+for _name in SCANCODES:
+    _NAME_LOOKUP[_name.lower()] = _name
+for _alias, _name in ALIASES.items():
+    _NAME_LOOKUP.setdefault(_alias.lower(), _name)
+for _name, _pretty_name in PRETTY.items():
+    _NAME_LOOKUP.setdefault(_pretty_name.lower(), _name)
+_NAME_LOOKUP.update({
+    "ctrl": "Control_L", "control": "Control_L",
+    "shift": "Shift_L", "alt": "Alt_L", "super": "Super_L",
+    "win": "Super_L", "meta": "Super_L",
+    "enter": "Return", "esc": "Escape", "spacebar": "space",
+    "del": "Delete", "ins": "Insert", "pgup": "Page_Up", "pgdn": "Page_Down",
+    "num+": "KP_Add", "num-": "KP_Subtract", "num*": "KP_Multiply",
+    "num/": "KP_Divide", "num.": "KP_Decimal", "numenter": "KP_Enter",
+})
+
+
+def parse_key_token(token: str) -> str:
+    """One key name from the editor -> canonical name, or raise MacroError."""
+    text = (token or "").strip()
+    if not text:
+        raise MacroError("empty key - type a key name")
+    if len(text) == 1:
+        char = text.lower() if text.isalpha() else text
+        if char in _CHAR_KEYS:
+            return _CHAR_KEYS[char]
+        if text in _SHIFTED_CHARS:
+            raise MacroError(
+                f"{text!r} is a shifted character; type "
+                f"Shift+{_SHIFTED_CHARS[text]} or put it inside quotes"
+            )
+    key = _NAME_LOOKUP.get(text.lower())
+    if key is not None:
+        return key
+    # normalise() gives the targeted message for F13/media keys.
+    return normalise(text)
+
+
+def parse_chord(text: str) -> list[str]:
+    """Parse one step, e.g. "Ctrl+Shift+t" -> ["Control_L", "Shift_L", "t"]."""
+    raw = (text or "").strip()
+    if not raw:
+        raise MacroError("empty step - type a key name")
+    # A key name may itself contain '+': the pretty name of KP_Add is "Num+".
+    # Resolve the whole field as one key before treating '+' as a chord join.
+    try:
+        return [parse_key_token(raw)]
+    except MacroError:
+        pass
+    pieces = raw.split("+")
+    keys = [parse_key_token(piece) for piece in pieces]
+    keys = [key for key in keys if key]
+    if not keys:
+        raise MacroError("empty step - type a key name")
+    if len(set(keys)) != len(keys):
+        raise MacroError("the same key is listed twice in one step")
+    return keys
+
+
+def literal_text_steps(text: str) -> list[list[str]]:
+    """Turn plain text into sequential steps ("Hi!" -> H, i, !)."""
+    steps: list[list[str]] = []
+    for char in text:
+        key = _CHAR_KEYS.get(char)
+        if key is not None:
+            steps.append([key])
+            continue
+        shifted = _SHIFTED_CHARS.get(char)
+        if shifted is not None:
+            steps.append(["Shift_L", shifted])
+            continue
+        if char.isascii() and char.isupper():
+            steps.append(["Shift_L", char.lower()])
+            continue
+        raise MacroError(
+            f"cannot type {char!r} - the EC has no scan code for it"
+        )
+    return steps
+
+
+def parse_steps(text: str) -> list[list[str]]:
+    """Parse an editor field into macro steps.
+
+    * ``"..."`` (double-quoted) is literal text: one step per character.
+    * otherwise ``+`` joins keys into one step and commas / semicolons /
+      whitespace separate steps, so ``"h e"`` and ``"h,e"`` are both two steps.
+    * an empty value means "no steps" (the row was cleared).
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    if raw.startswith('"'):
+        if len(raw) < 2 or not raw.endswith('"'):
+            raise MacroError('unterminated quote - close the text with "')
+        return literal_text_steps(raw[1:-1])
+    # "Ctrl + t" means one chord: allow spaces around '+'.
+    raw = re.sub(r"\s*\+\s*", "+", raw)
+    tokens = [token for token in re.split(r"[,;\s]+", raw) if token]
+    steps: list[list[str]] = []
+    for token in tokens:
+        steps.append(parse_chord(token))
+    return steps
+
+
+def format_chord(chord: list[str]) -> str:
+    """Editor spelling of one step: the pretty names, joined with '+'."""
+    if not chord:
+        return ""
+    return "+".join(pretty(key) for key in chord)
+
+
+def format_steps(chords: list[list[str]]) -> str:
+    """Editor spelling of a whole macro: steps separated by ', '."""
+    return ", ".join(format_chord(chord) for chord in chords if chord)
+
+
+def split_chord(chord: list[str]) -> list[list[str]]:
+    """Split a mis-detected chord into sequential single-key steps."""
+    return [[key] for key in chord if key]
 
 
 # Slot name -> chords for the stock numpad layout used by the reference driver.
