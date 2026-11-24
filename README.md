@@ -1,5 +1,7 @@
 # OMEN Macro Keys
 
+[![Latest release](https://img.shields.io/github/v/release/clayleopardlabs/omen-macro?label=release)](https://github.com/clayleopardlabs/omen-macro/releases/latest)
+
 Make the six macro keys (P1-P6) on an HP OMEN laptop work on Linux, and choose
 what each one types.
 
