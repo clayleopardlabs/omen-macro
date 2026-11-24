@@ -365,6 +365,9 @@ _NAME_LOOKUP.update({
     "num/": "KP_Divide", "num.": "KP_Decimal", "numenter": "KP_Enter",
 })
 
+#: The chord separator, '+', is also part of the pretty name of KP_Add
+#: ("Num+"); see _split_chord_tokens().
+
 
 def parse_key_token(token: str) -> str:
     """One key name from the editor -> canonical name, or raise MacroError."""
@@ -392,13 +395,18 @@ def parse_chord(text: str) -> list[str]:
     raw = (text or "").strip()
     if not raw:
         raise MacroError("empty step - type a key name")
+    # "Ctrl + t" means one chord; accept spaces around the join even when the
+    # caller passes a single field (parse_steps() splits on whitespace first).
+    raw = re.sub(r"\s*\+\s*", "+", raw)
     # A key name may itself contain '+': the pretty name of KP_Add is "Num+".
     # Resolve the whole field as one key before treating '+' as a chord join.
     try:
         return [parse_key_token(raw)]
     except MacroError:
         pass
-    pieces = raw.split("+")
+    # Mixed chords need the unambiguous spelling: "Ctrl+Num+" cannot be split
+    # on '+' alone, because "Num+" is itself a key name (KP_Add).
+    pieces = _split_chord_tokens(raw)
     keys = [parse_key_token(piece) for piece in pieces]
     keys = [key for key in keys if key]
     if not keys:
@@ -406,6 +414,39 @@ def parse_chord(text: str) -> list[str]:
     if len(set(keys)) != len(keys):
         raise MacroError("the same key is listed twice in one step")
     return keys
+
+
+def _split_chord_tokens(raw: str) -> list[str]:
+    """Split one chord field on '+' without breaking key names that contain it.
+
+    "Num+" is the pretty name of KP_Add, so a '+' belongs to the key name when
+    the text so far plus '+' is a known name.  That makes "Ctrl+Num+" parse as
+    Ctrl + KP_Add instead of Ctrl + "Num".  A separator with no key on one side
+    ("Ctrl+", "+a", "a++b") is still an error, not a silently shortened chord.
+    """
+    tokens: list[str] = []
+    current = ""
+    pending_join = False
+    for char in raw:
+        if char == "+":
+            if (current + "+").lower() in _NAME_LOOKUP:
+                current += "+"
+                pending_join = False
+                continue
+            if not current.strip():
+                raise MacroError("empty key - type a key name")
+            tokens.append(current.strip())
+            current = ""
+            pending_join = True
+            continue
+        pending_join = False
+        current += char
+    if not current.strip():
+        if pending_join:
+            raise MacroError("empty key - type a key name")
+    else:
+        tokens.append(current.strip())
+    return tokens
 
 
 def literal_text_steps(text: str) -> list[list[str]]:
@@ -454,10 +495,19 @@ def parse_steps(text: str) -> list[list[str]]:
 
 
 def format_chord(chord: list[str]) -> str:
-    """Editor spelling of one step: the pretty names, joined with '+'."""
+    """Editor spelling of one step that parse_chord() reads back unchanged.
+
+    Pretty names are used where they are unambiguous.  A key whose pretty name
+    contains the chord separator ("Num+" for KP_Add) falls back to the
+    canonical names when it appears in a multi-key chord, because
+    "Ctrl+Num+" cannot be split reliably; a one-key chord stays "Num+".
+    """
     if not chord:
         return ""
-    return "+".join(pretty(key) for key in chord)
+    names = [pretty(key) for key in chord]
+    if len(names) > 1 and any("+" in name for name in names):
+        names = [normalise(key) for key in chord]
+    return "+".join(names)
 
 
 def format_steps(chords: list[list[str]]) -> str:

@@ -94,6 +94,14 @@ omen-macro-apply --status # expect applied=1
 sudo ./verify.sh # full check, including Secure Boot and the boot service
 ```
 
+**Updating only the app** (after a code change - no DKMS build, no module
+reload, no reboot; the macro keys keep working):
+
+```bash
+sudo ./install-userspace.sh
+# then close and reopen the "OMEN Macro Keys" window
+```
+
 **If nothing happens:** reboot once (the old module may have still been
 resident during the first upload) and check `omen-macro-apply --status`. If the
 GUI banner still starts with *hardware interface not found* and Secure Boot is
@@ -191,6 +199,37 @@ classic case is Ctrl+Alt+T, which opens a terminal and steals focus before
 the T reaches the window). For those, use the **Keys** button on the row to
 tick modifiers and pick the key by hand; what you compose is exactly what the
 EC will replay.
+
+### Editing a macro by hand
+
+Recording cannot tell "pressed together" from "pressed a moment too soon", so
+a fast sequence sometimes lands as one chord (`h` and `e` stored as `h+e`).
+Every P-key row has an **Edit** button that opens the macro one step per line,
+so you can repair that step instead of recording the whole macro again:
+
+- One row is one **step** - the keys the EC presses together. `h+e` is h and e
+  at the same time; `h e` or `h,e` is h then e. To fix the mis-detected chord
+  press **Split** on that row (it becomes `h`, `e`), or just retype the row.
+- **Insert** adds an empty step after a row, **Delete** removes a row and
+  **Add step** appends one at the end. Text you have typed but not yet applied
+  is kept when you split/insert/delete.
+- A row may hold several steps at once: typing `h e l l o` in one row gives
+  five sequential steps.
+- Wrap text in double quotes to type it literally: `"Hi, you"` becomes
+  Shift+h, i, comma, space, y, o, u. Uppercase letters and shifted symbols
+  (`!`, `?`, `:` ...) get Shift automatically (US layout).
+- Key names ignore case and accept the names the window shows plus the common
+  spellings: `Ctrl`, `Shift`, `Alt`, `Super`, `Enter`, `Esc`, `Space`, `Tab`,
+  `Backspace`, `PgUp`, arrows, `KP_1`, `Num+`, or the canonical `Control_L`.
+  `+` joins a chord, so `Ctrl+Shift+t` is one step (spaces around `+` are
+  fine).
+- The line under the list previews the macro and its size against the EC's
+ 254-byte budget. **OK** saves and sends it like every other change; **Reset**
+  restores the saved steps and **Cancel** closes without touching the macro.
+  If a step cannot be read the dialog says which row to fix and stays open.
+
+**Keys** is still the fastest way to compose a fixed shortcut from scratch;
+**Edit** is for taking an existing macro apart.
 
 ### Profiles
 
@@ -323,10 +362,19 @@ slower, because it rebuilds the DKMS package.
 
 ```bash
 python3 tests/test_codec.py # encoder format tests, no hardware needed
+python3 tests/test_editor.py # manual-editor syntax: text <-> steps, quotes, KP_Add
 python3 tests/test_profiles.py # profile store, migration, active pointer
 python3 tests/test_omen_key.py # shortcut helpers (plus a read-only live check)
 python3 tests/test_auto_switch.py # focus matcher, rules file (plus live probe)
-python3 -m omen_macro.gui --selftest # recording + encoder + profiles + matcher
+python3 tests/test_boot_diag.py # missing-interface diagnosis (Secure Boot etc.)
+python3 -m omen_macro.gui --selftest # recording + encoder + profiles + editor
+```
+
+The editor dialog has a real-widget smoke test too; it needs a graphical
+session, shows no window, and drives the actual Split/Insert/Delete/OK buttons:
+
+```bash
+DISPLAY=:0 python3 tests/gui_integration.py # prints SKIPPED without a display
 ```
 
 ## Credits

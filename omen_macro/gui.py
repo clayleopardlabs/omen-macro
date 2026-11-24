@@ -179,6 +179,83 @@ def build_chord(modifiers: list[str], key: str) -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
+# Step editor helpers (no GTK needed - reused by the dialog and the selftest)
+#
+# Recording turns every key that is down at the same moment into one chord, so
+# two keys pressed one after the other are sometimes stored together ("h+e").
+# The editor shows one step per row as text, which makes that bad step
+# retypeable: pressing Split turns it into the two steps "h" and "e" without
+# touching the rest of the macro.
+# --------------------------------------------------------------------------- #
+def format_editor_entry(chord: list[str]) -> str:
+    """Editor spelling of one step ("Ctrl+c"), or "" for an empty step.
+
+    Uses codec.format_chord() so parse_editor_entries() reads the text back to
+    exactly the same chord; the dialog round-trips a saved macro through it.
+    """
+    if not chord:
+        return ""
+    return codec.format_chord(chord)
+
+
+def parse_editor_entries(texts: list[str]) -> list[list[str]]:
+    """Flatten the editor's per-row text into macro steps, in order.
+
+    A row may hold more than one step ("h e" or '"Hi!"'), so rows are parsed
+    with codec.parse_steps() and concatenated.  Blank rows (the "Add step"
+    placeholder) are skipped, so an editor with only blank rows means "clear
+    the slot".  Errors name the 1-based row to fix, e.g.
+    "step 3: unsupported key 'Bogus': ...", instead of a position in the
+    flattened list.
+    """
+    steps: list[list[str]] = []
+    for index, text in enumerate(texts, start=1):
+        try:
+            steps.extend(codec.parse_steps(text))
+        except codec.MacroError as exc:
+            raise codec.MacroError(f"step {index}: {exc}") from None
+    return steps
+
+
+def _payload_size(steps: list[list[str]], spacing_ms: int) -> int:
+    """Payload bytes codec.encode_entry() would write, without the size limit.
+
+    Kept separate so editor_preview() can still show how far over the limit a
+    macro is; codec.encode_entry() only raises, it does not report the size.
+    """
+    size = 0
+    for index, chord in enumerate(steps):
+        size += len(codec.encode_chord(chord))
+        if index != len(steps) - 1:
+            size += len(codec.encode_delay(int(spacing_ms)))
+    return size
+
+
+def editor_preview(steps: list[list[str]], spacing_ms: int) -> str:
+    """One-line status for the editor: step count, payload budget and steps.
+
+    Example: "3 steps, 10/254 bytes: h, e, Ctrl+c".  Never raises: an unknown
+    key or an over-long macro is described in the text so the dialog can show
+    the problem while the user is still typing.
+    """
+    count = len(steps)
+    label = f"{count} step" if count == 1 else f"{count} steps"
+    if not steps:
+        return f"{label} - OK clears the slot"
+    try:
+        payload = _payload_size(steps, spacing_ms)
+    except codec.MacroError as exc:
+        return f"{label}: {exc}"
+    summary = codec.describe_entry(steps)
+    text = f"{label}, {payload}/{codec.MAX_ENTRY_PAYLOAD} bytes: {summary}"
+    if payload > codec.MAX_ENTRY_PAYLOAD:
+        over = payload - codec.MAX_ENTRY_PAYLOAD
+        return (f"{text} - macro too long by {over} bytes, remove some "
+                "keystrokes")
+    return text
+
+
+# --------------------------------------------------------------------------- #
 # Recording state machine - pure Python so it can be tested without a display
 # --------------------------------------------------------------------------- #
 class Recording:
@@ -374,7 +451,7 @@ class MacroWindow(Gtk.ApplicationWindow):
 
     def _add_row(self, listbox: Gtk.ListBox, slot: str,
                  with_command: bool = False) -> None:
-        """Append one [name | summary | Record | Keys | Cmd? | Clear] row."""
+        """Append one [name | summary | Record | Keys | Edit | Cmd? | Clear] row."""
         row = Gtk.ListBoxRow()
         row.add_css_class("macro-row")
 
@@ -401,7 +478,14 @@ class MacroWindow(Gtk.ApplicationWindow):
         )
         keys.connect("clicked", lambda _btn, s=slot: self._open_keys_dialog(s))
 
-        widgets: list[Gtk.Widget] = [name_label, summary, record, keys]
+        edit = Gtk.Button(label="Edit")
+        edit.set_tooltip_text(
+            f"Edit {slot} step by step - fix a mis-recorded chord, "
+            "insert/delete steps, retype a step"
+        )
+        edit.connect("clicked", lambda _btn, s=slot: self._open_macro_editor(s))
+
+        widgets: list[Gtk.Widget] = [name_label, summary, record, keys, edit]
 
         cmd_btn = None
         if with_command:
@@ -432,6 +516,7 @@ class MacroWindow(Gtk.ApplicationWindow):
             "record": record,
             "clear": clear,
             "cmd": cmd_btn,
+            "edit": edit,
         }
 
     def _build_spacing_row(self) -> Gtk.Widget:
@@ -1264,6 +1349,304 @@ class MacroWindow(Gtk.ApplicationWindow):
         ok.connect("clicked", lambda _b: done(True))
         dialog.present()
 
+    def _open_macro_editor(self, slot: str) -> None:
+        """Edit slot's macro one step at a time, in place.
+
+        A recorded chord is every key the window saw held at once; when two
+        keys were really pressed one after the other the EC replays them
+        together and the macro is wrong.  This dialog shows the saved chords
+        as one text row per step, so the bad step can be retyped or split
+        without re-recording the rest of the macro.  Structural edits
+        (Split/Insert/Delete/Add step) capture what is currently typed before
+        re-rendering, so half-edited text is never lost; OK commits through
+        the same persist path as the Keys dialog (save profile + upload).
+        """
+        self._finish_recording()
+        dialog = Gtk.Window(transient_for=self, modal=True,
+                            title=f"Edit {slot} macro")
+        dialog.set_default_size(620, 520)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(outer, f"set_margin_{side}")(12)
+
+        hint = Gtk.Label(xalign=0)
+        hint.set_wrap(True)
+        hint.add_css_class("dim-label")
+        hint.set_text(
+            "One row is one step: the keys the EC presses together. Join keys "
+            "with + (Ctrl+Shift+t); a space or comma separates steps "
+            "(h e = h then e). Wrap text in \"double quotes\" to type it "
+            "literally (\"Hi!\" = Shift+h, i, Shift+1). Key names ignore "
+            "case: Ctrl, Shift, Alt, Super, Enter, Space, KP_1 ... Recorded "
+            "two keys as one chord by mistake? Press Split to turn h+e into "
+            "two steps."
+        )
+        outer.append(hint)
+
+        steps_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_vexpand(True)
+        scroller.set_child(steps_box)
+        outer.append(scroller)
+
+        add_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        add_btn = Gtk.Button(label="Add step")
+        add_btn.set_tooltip_text("Append an empty step at the end of the macro")
+        add_row.append(add_btn)
+        outer.append(add_row)
+
+        preview = Gtk.Label(xalign=0)
+        preview.set_wrap(True)
+        preview.add_css_class("dim-label")
+        outer.append(preview)
+
+        error_label = Gtk.Label(xalign=0)
+        error_label.set_wrap(True)
+        error_label.add_css_class("banner")
+        error_label.add_css_class("banner-error")
+        error_label.set_visible(False)
+        outer.append(error_label)
+
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        buttons.set_halign(Gtk.Align.END)
+        reset = Gtk.Button(label="Reset")
+        reset.set_tooltip_text("Throw away dialog edits, back to the saved steps")
+        cancel = Gtk.Button(label="Cancel")
+        ok = Gtk.Button(label="OK")
+        ok.add_css_class("suggested-action")
+        buttons.append(reset)
+        buttons.append(cancel)
+        buttons.append(ok)
+        outer.append(buttons)
+        dialog.set_child(outer)
+
+        saved: list[list[str]] = [
+            list(chord) for chord in (self.slots.get(slot) or [])
+        ]
+        texts: list[str] = [format_editor_entry(chord) for chord in saved]
+        entries: list[Gtk.Entry] = []
+        split_buttons: list[Gtk.Button] = []
+
+        def capture() -> None:
+            """Copy typed text into ``texts`` so a re-render cannot lose it."""
+            for index, entry in enumerate(entries):
+                if index < len(texts):
+                    texts[index] = entry.get_text()
+
+        def parsed_row(index: int) -> list[list[str]] | None:
+            """Steps of one row, or None while it is empty/invalid."""
+            if not 0 <= index < len(texts):
+                return None
+            try:
+                return codec.parse_steps(texts[index])
+            except codec.MacroError:
+                return None
+
+        def show_error(text: str) -> None:
+            if text:
+                error_label.set_text(text)
+                error_label.set_visible(True)
+            else:
+                error_label.set_text("")
+                error_label.set_visible(False)
+
+        def update_preview() -> None:
+            for index, button in enumerate(split_buttons):
+                steps = parsed_row(index)
+                button.set_sensitive(
+                    steps is not None and len(steps) == 1 and len(steps[0]) > 1
+                )
+            try:
+                steps = parse_editor_entries(texts)
+            except codec.MacroError as exc:
+                preview.set_text(f"cannot preview yet - {exc}")
+                return
+            # The rows parse again: drop an error left over from a failed OK,
+            # otherwise the red banner contradicts the green preview.
+            show_error("")
+            preview.set_text(
+                editor_preview(steps, int(self.spacing.get_value()))
+            )
+
+        def focus_entry(index: int) -> None:
+            def grab() -> bool:
+                if 0 <= index < len(entries):
+                    entries[index].grab_focus()
+                return False
+
+            GLib.idle_add(grab)
+
+        def focus_first(_window=None) -> None:
+            """Put the cursor in the first step (or Add step) when the dialog maps."""
+            if entries:
+                entries[0].grab_focus()
+            else:
+                add_btn.grab_focus()
+
+        def on_entry_changed(entry: Gtk.Entry, index: int) -> None:
+            if index < len(texts):
+                texts[index] = entry.get_text()
+            update_preview()
+
+        def render(focus: int | None = None) -> None:
+            while True:
+                child = steps_box.get_first_child()
+                if child is None:
+                    break
+                steps_box.remove(child)
+            entries.clear()
+            split_buttons.clear()
+            if not texts:
+                empty = Gtk.Label(
+                    label="no steps yet - use Add step to start a macro",
+                    xalign=0,
+                )
+                empty.add_css_class("dim-label")
+                steps_box.append(empty)
+            for index, text in enumerate(texts):
+                row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+
+                number = Gtk.Label(label=f"{index + 1}.", xalign=1)
+                number.add_css_class("dim-label")
+                number.set_size_request(32, -1)
+
+                entry = Gtk.Entry()
+                entry.set_text(text)
+                entry.set_hexpand(True)
+                entry.set_placeholder_text("one step, e.g. Ctrl+c or h")
+                entry.connect("changed", on_entry_changed, index)
+
+                split = Gtk.Button(label="Split")
+                split.set_tooltip_text(
+                    "Turn this chord into one step per key (h+e -> h, then e)"
+                )
+                split.connect("clicked", lambda _b, i=index: do_split(i))
+
+                insert = Gtk.Button(label="Insert")
+                insert.set_tooltip_text("Insert a new empty step after this one")
+                insert.connect("clicked", lambda _b, i=index: do_insert(i))
+
+                delete = Gtk.Button(label="Delete")
+                delete.set_tooltip_text("Remove this step from the macro")
+                delete.connect("clicked", lambda _b, i=index: do_delete(i))
+
+                row.append(number)
+                row.append(entry)
+                row.append(split)
+                row.append(insert)
+                row.append(delete)
+                steps_box.append(row)
+                entries.append(entry)
+                split_buttons.append(split)
+            update_preview()
+            if focus is not None:
+                focus_entry(focus)
+
+        def do_split(index: int) -> None:
+            """Replace this chord with one single-key step per key."""
+            capture()
+            steps = parsed_row(index)
+            if steps is None or len(steps) != 1 or len(steps[0]) < 2:
+                return
+            texts[index:index + 1] = [
+                format_editor_entry(step) for step in codec.split_chord(steps[0])
+            ]
+            show_error("")
+            render(focus=index)
+
+        def do_insert(index: int) -> None:
+            capture()
+            texts.insert(index + 1, "")
+            show_error("")
+            render(focus=index + 1)
+
+        def do_delete(index: int) -> None:
+            capture()
+            if not 0 <= index < len(texts):
+                return
+            texts.pop(index)
+            show_error("")
+            render(focus=min(index, len(texts) - 1) if texts else None)
+
+        def add_step(_button) -> None:
+            capture()
+            texts.append("")
+            show_error("")
+            render(focus=len(texts) - 1)
+
+        def reset_editor(_button) -> None:
+            texts[:] = [format_editor_entry(chord) for chord in saved]
+            show_error("")
+            render(focus=0 if texts else None)
+
+        def done(confirmed: bool) -> None:
+            if not confirmed:
+                dialog.close()
+                return
+            capture()
+            try:
+                steps = parse_editor_entries(texts)
+            except codec.MacroError as exc:
+                show_error(str(exc))
+                return
+            try:
+                # The dialog must report this itself: _persist() would only
+                # show it in the main window's banner, behind the modal.
+                codec.encode_entry(steps, int(self.spacing.get_value()))
+            except codec.MacroError as exc:
+                show_error(str(exc))
+                return
+            show_error("")
+            old = self.slots.get(slot)
+            if steps:
+                self.slots[slot] = [list(chord) for chord in steps]
+                note = f"{slot} = {codec.describe_entry(steps)}."
+            else:
+                self.slots.pop(slot, None)
+                note = f"{slot} cleared."
+            command = self.commands.get(slot)
+            if command:
+                note += (f" {slot} runs {command!r}, so its typing macro is "
+                         "still left out of the upload.")
+            if not self._persist(note):
+                # Roll the in-memory value back so the window does not show a
+                # macro that was not applied.  (_persist() saves the profile
+                # before uploading, so the file may already carry it; the main
+                # window banner says what failed.)  Report it here too: the
+                # main window is behind this modal dialog.
+                if old is None:
+                    self.slots.pop(slot, None)
+                else:
+                    self.slots[slot] = old
+                self._refresh_row(slot)
+                show_error("could not save or send the macro - see the "
+                           "message in the main window")
+                return
+            dialog.close()
+
+        add_btn.connect("clicked", add_step)
+        reset.connect("clicked", reset_editor)
+        cancel.connect("clicked", lambda _b: done(False))
+        ok.connect("clicked", lambda _b: done(True))
+
+        keys = Gtk.EventControllerKey()
+        keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+
+        def on_key(_controller, keyval, _keycode, _state) -> bool:
+            if keyval == Gdk.KEY_Escape:
+                done(False)
+                return True
+            return False
+
+        keys.connect("key-pressed", on_key)
+        dialog.add_controller(keys)
+
+        dialog.connect("map", focus_first)
+        render(focus=0 if texts else None)
+        dialog.present()
+
     def _on_cmd_clicked(self, slot: str) -> None:
         self._finish_recording()
         self._open_command_dialog(slot)
@@ -1887,6 +2270,87 @@ def selftest() -> int:
         except codec.MacroError:
             check(f"manual chord rejects {bad_mods!r}/{bad_key!r}",
                   "MacroError", "MacroError")
+
+    # 13. Step editor: fix a mis-recorded chord without re-recording.
+    check("editor entry formats a chord",
+          format_editor_entry(["Control_L", "c"]), "Ctrl+c")
+    check("editor entry of an empty step is blank",
+          format_editor_entry([]), "")
+
+    roundtrip = [
+        ["h"], ["e"], ["Control_L", "c"], ["Shift_L", "t"],
+        ["KP_Add"], ["space"], ["Control_L", "Shift_L", "t"],
+    ]
+    check("editor entry round-trips through the parser",
+          [parse_editor_entries([format_editor_entry(chord)])
+           for chord in roundtrip],
+          [[chord] for chord in roundtrip])
+
+    # codec.format_chord() spells a chord that mixes KP_Add with another key
+    # with canonical names ("Control_L+KP_Add") because "Ctrl+Num+" would read
+    # back as the key "Num"; a lone KP_Add keeps the pretty "Num+".
+    mixed_chord = ["Control_L", "KP_Add"]
+    check("mixed numpad-plus chord uses the canonical spelling",
+          format_editor_entry(mixed_chord), "Control_L+KP_Add")
+    check("mixed numpad-plus chord still round-trips",
+          parse_editor_entries([format_editor_entry(mixed_chord)]), [mixed_chord])
+    check("unambiguous row keeps the pretty spelling",
+          format_editor_entry(["KP_Add"]), "Num+")
+    check("the canonical spelling can be typed by hand",
+          parse_editor_entries(["Ctrl+KP_Add"]), [mixed_chord])
+    check("hand-typed Num+ still means KP_Add",
+          parse_editor_entries(["Ctrl+Num+"]), [mixed_chord])
+    check("every key has an editable row",
+          [parse_editor_entries([format_editor_entry([key])])
+           for key in codec.SCANCODES],
+          [[[key]] for key in codec.SCANCODES])
+
+    check("editor entries flatten in order",
+          parse_editor_entries(["h", "", "e", "Ctrl+c"]),
+          [["h"], ["e"], ["Control_L", "c"]])
+    check("one row may hold several steps",
+          parse_editor_entries(["h e", "l"]),
+          [["h"], ["e"], ["l"]])
+    check("blank rows mean an empty macro",
+          parse_editor_entries(["", "  "]), [])
+    check("quoted text becomes sequential steps",
+          parse_editor_entries(['"Hi!"']),
+          [["Shift_L", "h"], ["i"], ["Shift_L", "1"]])
+    try:
+        parse_editor_entries(["h", "e", "Bogus"])
+        check("editor error names the row", "no error", "MacroError")
+    except codec.MacroError as exc:
+        check("editor error names the row", str(exc).startswith("step 3:"), True)
+
+    # The bug report: recording stored h and e as one chord. The editor shows
+    # "h+e"; Split rewrites it as the two steps "h" and "e"; OK must encode
+    # exactly the bytes a hand-built [["h"], ["e"]] macro would produce.
+    misrecorded = [["h", "e"]]
+    check("mis-recorded chord shows as one row",
+          [format_editor_entry(chord) for chord in misrecorded], ["h+e"])
+    split_rows = [format_editor_entry(chord)
+                  for chord in codec.split_chord(codec.parse_chord("h+e"))]
+    check("Split turns h+e into two rows", split_rows, ["h", "e"])
+    fixed_steps = parse_editor_entries(split_rows)
+    check("fixed macro is two sequential steps", fixed_steps, [["h"], ["e"]])
+    check("fixed macro encodes like the hand-built one",
+          codec.encode_entry(fixed_steps, DEFAULT_SPACING_MS),
+          codec.encode_entry([["h"], ["e"]], DEFAULT_SPACING_MS))
+
+    # 14. Live preview: step count + payload budget, and never raises.
+    preview_text = editor_preview([["h"], ["e"], ["Control_L", "c"]],
+                                  DEFAULT_SPACING_MS)
+    check("preview counts the steps", "3 steps" in preview_text, True)
+    check("preview lists the steps", "h, e, Ctrl+c" in preview_text, True)
+    check("preview shows the byte budget", "/254 bytes" in preview_text, True)
+    check("preview of an empty editor mentions clearing",
+          "clears the slot" in editor_preview([], DEFAULT_SPACING_MS), True)
+    check("preview flags an over-long macro",
+          "macro too long" in editor_preview([["a"]] * 120, DEFAULT_SPACING_MS),
+          True)
+    check("preview survives an unencodable key",
+          editor_preview([["Bogus"]], DEFAULT_SPACING_MS).startswith("1 step:"),
+          True)
 
     print()
     if failures:
