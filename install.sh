@@ -7,15 +7,21 @@
 #   1. backs up and patches /usr/src/hp-omen-extra-2.1.2/hp-wmi.c so the driver
 #      exposes a writable 4096-byte EC macro table (macro_profile/macro_status)
 #   2. rebuilds + reinstalls the hp-omen-extra DKMS package and reloads it
-#   3. installs the userspace encoder, CLI, daemon and GTK GUI to /usr/local
-#   4. grants the omen-hw group write access to macro_profile (udev rule)
-#   5. installs a oneshot systemd unit that re-uploads the active profile
+#   3. checks Secure Boot: with it enabled the DKMS key
+#      (/var/lib/shim-signed/mok/MOK.der) has to be enrolled once, otherwise the
+#      kernel rejects the freshly built module with "Key was rejected by
+#      service".  The enrolment itself is staged by ./fix-secureboot.sh (this
+#      script only detects the situation and stops before claiming success).
+#   4. installs the userspace encoder, CLI, daemon and GTK GUI to /usr/local
+#   5. grants the omen-hw group write access to macro_profile (udev rule)
+#   6. installs a oneshot systemd unit that re-uploads the active profile
 #      at boot (the EC forgets it on a cold boot), plus a per-user unit for
 #      the optional auto-switch daemon (off unless enabled in the GUI)
-#   6. uploads the active profile so P1-P6 emit numpad 1-6 immediately
+#   7. uploads the active profile so P1-P6 emit numpad 1-6 immediately
 #      (first run seeds a Default profile, migrating legacy profile.json)
 #
-# Revert with ./revert.sh
+# Re-running is safe.  Revert with ./revert.sh; repair a Secure Boot rejection
+# without rebuilding anything with ./fix-secureboot.sh.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -69,7 +75,15 @@ say "reloading hp_wmi"
 modprobe -r hp_omen_extra 2>/dev/null || true
 modprobe -r hp_wmi 2>/dev/null || true
 RELOADED=0
-if modprobe hp_wmi 2>/dev/null; then RELOADED=1; else echo "could not unload the old hp_wmi (in use?) - a reboot is needed"; fi
+SB_BLOCKED=0
+if MODPROBE_OUT="$(modprobe hp_wmi 2>&1)"; then
+	RELOADED=1
+else
+	printf '%s\n' "${MODPROBE_OUT}"
+	if [[ "${MODPROBE_OUT}" == *"Key was rejected by service"* ]]; then
+		SB_BLOCKED=1
+	fi
+fi
 modprobe hp_omen_extra 2>/dev/null || true
 for _ in $(seq 1 20); do [[ -e "${SYSFS}/macro_profile" ]] && break; sleep 0.25; done
 [[ -e "${SYSFS}/macro_profile" ]] || RELOADED=0
@@ -78,7 +92,33 @@ chgrp omen-hw "${SYSFS}/macro_profile" 2>/dev/null || true
 chmod 0220 "${SYSFS}/macro_profile" 2>/dev/null || true
 chmod 0444 "${SYSFS}/macro_status" 2>/dev/null || true
 
-# ---------------------------------------------------------------- 3. userspace
+# ------------------------------------------- 2b. Secure Boot (module signature)
+# DKMS signs the module with /var/lib/shim-signed/mok/MOK.der, but with Secure
+# Boot on the kernel only inserts modules signed by a key in shim's MOK list.
+# That list normally holds just Canonical's CA until the DKMS key is enrolled
+# once, so meanwhile the module loads nowhere: modprobe fails with
+# "Key was rejected by service" and macro_profile never appears.  Enrolling it
+# needs a one-time password plus a confirmation in the blue MOK screen at the
+# next boot, so all we do here is notice the situation and let the end of the
+# script stop instead of printing a success message that would be wrong.
+MOK_DER="/var/lib/shim-signed/mok/MOK.der"
+MOK_CN="Omen Secure Boot Module Signature key"
+if command -v mokutil >/dev/null && mokutil --sb-state 2>/dev/null | grep -q 'SecureBoot enabled'; then
+	say "Secure Boot is enabled - checking the DKMS signing key"
+	if [[ -f "${MOK_DER}" ]] && command -v openssl >/dev/null; then
+		_CN="$(openssl x509 -inform DER -in "${MOK_DER}" -noout -subject 2>/dev/null \
+			| sed -n 's/^subject=.*CN *= *//p' || true)"
+		if [[ -n "${_CN}" ]]; then MOK_CN="${_CN}"; fi
+	fi
+	if [[ -f "${MOK_DER}" ]] && mokutil --list-enrolled 2>/dev/null | grep -qF -- "${MOK_CN}"; then
+		echo "  MOK key '${MOK_CN}' is enrolled"
+	else
+		SB_BLOCKED=1
+		echo "  MOK key '${MOK_CN}' is NOT enrolled - the kernel will reject the module"
+	fi
+fi
+
+# ---------------------------------------------------------------- 4. userspace
 say "installing userspace tools to ${LIBDIR}"
 install -d "${LIBDIR}/omen_macro"
 install -m644 "${SCRIPT_DIR}"/omen_macro/*.py "${LIBDIR}/omen_macro/"
@@ -102,12 +142,12 @@ LAUNCHER
 chmod 755 /usr/local/bin/omen-macro /usr/local/bin/omen-macro-apply /usr/local/bin/omen-macro-auto
 install -Dm644 "${SCRIPT_DIR}/desktop/omen-macro.desktop" /usr/share/applications/omen-macro.desktop
 
-# ---------------------------------------------------------------- 4. config
+# ---------------------------------------------------------------- 5. config
 # Seeding happens at runtime: the first apply (below) or GUI start migrates a
 # legacy profile.json and writes profiles/Default.json + active-profile.
 install -d -g omen-hw -m 2775 /etc/omen-macro
 
-# ---------------------------------------------------------------- 5. boot service
+# ---------------------------------------------------------------- 6. boot service
 install -Dm644 "${SCRIPT_DIR}/systemd/omen-macro-apply.service" /etc/systemd/system/omen-macro-apply.service
 systemctl daemon-reload
 systemctl enable omen-macro-apply.service >/dev/null
@@ -115,7 +155,38 @@ systemctl enable omen-macro-apply.service >/dev/null
 # Optional auto-switch daemon: per-user unit, stays off until the GUI opts in.
 install -Dm644 "${SCRIPT_DIR}/systemd/omen-macro-auto.service" /etc/systemd/user/omen-macro-auto.service
 
-# ---------------------------------------------------------------- 6. apply now
+# ---------------------------------------------------------------- 7. apply now
+if [[ ${RELOADED} -eq 0 && ${SB_BLOCKED} -eq 1 ]]; then
+	# The module is built, installed and signed, but the kernel will not insert
+	# it: Secure Boot only trusts keys in shim's MOK list and the DKMS key is
+	# not enrolled yet.  fix-secureboot.sh stages that enrolment (a one-time
+	# step per machine) and prints the blue MOK screen keystrokes.  No DKMS
+	# rebuild is involved, so do not pretend the install finished.
+	say "Secure Boot is blocking the patched module"
+	if [[ -x "${SCRIPT_DIR}/fix-secureboot.sh" ]]; then
+		"${SCRIPT_DIR}/fix-secureboot.sh" || true
+	else
+		cat <<'MSG'
+Enrol the DKMS signing key by hand, then reboot:
+    sudo mokutil --import /var/lib/shim-signed/mok/MOK.der
+    sudo reboot
+At the blue "MOK management" screen choose Enroll MOK -> View key ->
+Continue -> Yes, type the one-time password, then Reboot.
+MSG
+	fi
+	cat <<'MSG'
+
+Everything except the module load is installed: userspace tools, udev rule and
+the boot service are in place.  P1-P6 stay dead until the key is enrolled and
+you have rebooted once - after that boot the service uploads the profile
+automatically and there is nothing left to run.
+
+Re-run ./install.sh if you prefer it to confirm the result, or use:
+    sudo ./verify.sh
+MSG
+	exit 1
+fi
+
 say "uploading the active profile"
 if [[ ${RELOADED} -eq 1 ]]; then
 	omen-macro-apply || {
@@ -138,6 +209,10 @@ Configure your own macros with:
 
 If the keys do nothing, reboot once: the old module may still have been
 resident while the EC rejected the first upload.
+
+If Secure Boot gets enabled later (e.g. from Windows), the kernel starts
+rejecting this module - run sudo ./fix-secureboot.sh once and confirm the
+enrolment in the blue MOK screen at the next boot.
 DONE
 else
 	echo

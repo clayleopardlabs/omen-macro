@@ -63,6 +63,7 @@ if str(_PKG_PARENT) not in sys.path:
     sys.path.insert(0, str(_PKG_PARENT))
 
 from omen_macro import auto_switch  # noqa: E402
+from omen_macro import boot_diag  # noqa: E402
 from omen_macro import codec  # noqa: E402
 from omen_macro import omen_key  # noqa: E402
 from omen_macro import profiles  # noqa: E402
@@ -83,7 +84,8 @@ WINDOW_TITLE = "OMEN Macro Keys"
 DEFAULT_SPACING_MS = 20
 MAX_SPACING_MS = 2040  # codec.build_profile() ceiling
 
-MSG_NO_HW = "hardware interface not found - run install.sh"
+# The bare fact; boot_diag supplies the reason (Secure Boot, missing module, ...).
+MSG_NO_HW = "hardware interface not found"
 MSG_NO_PERM = "permission denied - run install.sh to grant omen-hw write access"
 
 USAGE = """\
@@ -292,15 +294,16 @@ class MacroWindow(Gtk.ApplicationWindow):
         self._load_store()
         self._refresh_omen_status()
         self._refresh_auto_status()
-        self._set_status(
-            "\n".join(
-                [
-                    self._device_line(),
-                    self._profile_line(),
-                    "Nothing has been applied to the EC yet.",
-                ]
-            )
-        )
+        diagnosis = self._hardware_diagnosis()
+        lines = [
+            self._device_line(diagnosis),
+            self._profile_line(),
+            "Nothing has been applied to the EC yet.",
+        ]
+        if diagnosis is not None:
+            lines += ["", diagnosis.hint]
+            self._set_banner(f"{MSG_NO_HW} - {diagnosis.summary}", "banner-error")
+        self._set_status("\n".join(lines))
 
     # -- construction ------------------------------------------------------
     def _build_ui(self) -> None:
@@ -1587,10 +1590,19 @@ class MacroWindow(Gtk.ApplicationWindow):
             self._loading = False
 
     # -- hardware / saving -------------------------------------------------
-    def _device_line(self) -> str:
+    def _hardware_diagnosis(self) -> boot_diag.Diagnosis | None:
+        """Explain a missing macro_profile, or None when the interface is there."""
+        if (sysfs_dir() / PROFILE_ATTR).exists():
+            return None
+        return boot_diag.diagnose_missing_interface(sysfs_dir())
+
+    def _device_line(self, diagnosis: boot_diag.Diagnosis | None = None) -> str:
         path = sysfs_dir() / PROFILE_ATTR
-        state = "present" if path.exists() else MSG_NO_HW
-        return f"device: {path} ({state})"
+        if diagnosis is None and not path.exists():
+            diagnosis = boot_diag.diagnose_missing_interface(sysfs_dir())
+        if diagnosis is None:
+            return f"device: {path} (present)"
+        return f"device: {path} (missing - {diagnosis.summary})"
 
     def _upload_ec(self) -> tuple[bool, str]:
         """Send the current window (minus command-bound slots) to the EC."""
@@ -1605,8 +1617,9 @@ class MacroWindow(Gtk.ApplicationWindow):
         try:
             written = write_profile(profile, sysfs)
         except (FileNotFoundError, NotADirectoryError):
-            self._set_banner(MSG_NO_HW, "banner-error")
-            self._set_status(f"{path} does not exist.")
+            diagnosis = boot_diag.diagnose_missing_interface(sysfs)
+            self._set_banner(f"{MSG_NO_HW} - {diagnosis.summary}", "banner-error")
+            self._set_status(f"{path} does not exist.\n\n{diagnosis.hint}")
             return False, ""
         except PermissionError:
             self._set_banner(MSG_NO_PERM, "banner-error")

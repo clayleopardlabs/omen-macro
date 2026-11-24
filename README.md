@@ -91,10 +91,85 @@ legacy `profile.json` if you have one.
 ```bash
 sudo libinput debug-events --show-keycodes # expect KEY_KP1
 omen-macro-apply --status # expect applied=1
+sudo ./verify.sh # full check, including Secure Boot and the boot service
 ```
 
 **If nothing happens:** reboot once (the old module may have still been
-resident during the first upload) and check `omen-macro-apply --status`.
+resident during the first upload) and check `omen-macro-apply --status`. If the
+GUI banner still starts with *hardware interface not found* and Secure Boot is
+on, see [Secure Boot](#secure-boot) - the module is built and signed
+correctly, only its key has not been enrolled yet.
+
+`sudo ./install.sh` is safe to re-run. To repair only a Secure Boot rejection,
+without touching DKMS, use `sudo ./fix-secureboot.sh`:
+
+```bash
+sudo ./fix-secureboot.sh # check/enrol the DKMS key, reload, restart the service
+```
+
+### Secure Boot
+
+Ubuntu only accepts a kernel module signed by a key it trusts - on a Secure
+Boot machine that means the platform keyring plus shim's MOK list. DKMS signs
+the patched `hp_wmi` with this machine's own MOK key,
+`/var/lib/shim-signed/mok/MOK.der` (`CN=Omen Secure Boot Module Signature key`),
+but that key is **not** in shim's MOK list until you enrol it once. Until then
+every boot logs
+
+```
+modprobe: ERROR: could not insert 'hp_wmi': Key was rejected by service
+```
+
+and `macro_profile` never appears, so the GUI banner starts with *hardware
+interface not found* (it names the reason next to it) and `omen-macro-apply`
+exits with code 3. Nothing is wrong with the driver - it is built, patched and
+signed; only the enrolment is missing. No rebuild is needed, and
+`hp_omen_extra` (fan/thermal) fails the same way for the same reason.
+
+Enrol the key once:
+
+```bash
+cd omen-macro
+sudo ./fix-secureboot.sh # stages the enrolment, prints the steps below
+sudo reboot
+```
+
+At the blue **MOK management** screen that appears before the Ubuntu boot
+screen (it only appears when an enrolment is pending):
+
+1. `Enroll MOK`
+2. `View key` - it must read `CN=Omen Secure Boot Module Signature key`
+3. `Continue`, then `Yes`
+4. type the one-time password you chose when `fix-secureboot.sh` ran
+5. `Reboot`
+
+Do **not** pick `Continue boot` (the first entry): it skips the enrolment, the
+module stays rejected, and you have to start over. The password is not stored
+anywhere and only unlocks this one enrolment.
+
+After that boot nothing else is needed: `hp_wmi` loads by itself and
+`omen-macro-apply.service` uploads the active profile as usual. Confirm with
+`sudo ./verify.sh` or by pressing `P1`.
+
+`fix-secureboot.sh` is safe to re-run and idempotent. It only checks the
+signature, refreshes the userspace files from the repo, reinstalls the udev
+rule and restarts the boot service. It never rebuilds DKMS, edits kernel
+sources, changes firmware/BIOS settings or uses the network. It exits `0` when
+the keys work immediately, `10` when a reboot is required to confirm the
+enrolment, and `1` on a failed precondition (the message says which).
+
+Out of scope but worth knowing: if `modinfo -F signer hp_wmi` prints nothing
+the module is not signed at all - reinstall `hp-omen-extra` so DKMS signs it
+again before enrolling anything, otherwise enrolling the key cannot help.
+
+**Keep Secure Boot on, or turn it off?** Keeping it on is the recommended path:
+the key is enrolled for this machine only, it does not vouch for arbitrary
+modules, and Windows keeps its own Secure Boot state (on this laptop Windows
+re-enabled Secure Boot as an overheating workaround, which is what broke the
+macro keys). Disabling Secure Boot in the BIOS/UEFI setup also makes the module
+load (unsigned), but the keys die again the moment Secure Boot is re-enabled,
+and a Windows or firmware update may re-enable it for you.
+
 
 ## Use
 
@@ -207,11 +282,18 @@ Clears the EC table, restores the backed-up `hp-wmi.c`, rebuilds the DKMS
 module, and removes the udev rule, services and installed binaries. The config
 directory (`/etc/omen-macro`) is kept.
 
+It does not withdraw the enrolled MOK key: the key alone is harmless (it only
+vouches for modules DKMS signs on this machine), and removing it needs another
+confirmation in the blue MOK screen (`sudo mokutil --delete /var/lib/shim-signed/mok/MOK.der`,
+then reboot).
+
 ## Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
-| `macro_profile` missing | patched module not loaded - `dmesg \| grep macro`, or reboot |
+| `modprobe: ERROR: could not insert 'hp_wmi': Key was rejected by service` | Secure Boot is on and the DKMS key is not enrolled - `sudo ./fix-secureboot.sh`, then confirm the blue MOK screen at the next boot. See [Secure Boot](#secure-boot) |
+| GUI banner starts with `hardware interface not found` (or `omen-macro-apply` exits 3) | the patched module is not loaded - the banner names the reason. With Secure Boot on it is usually the missing MOK enrolment above; otherwise run `sudo ./install.sh`, or reboot if a rebuild just happened |
+| `macro_profile` missing | patched module not loaded - `dmesg \| grep macro`, `sudo ./verify.sh`, or reboot. Check `modinfo -F signer hp_wmi` and [Secure Boot](#secure-boot) first |
 | `permission denied` writing | udev rule/permissions - `sudo ./fix-boot.sh`, or `sudo chmod 0220 …` |
 | `macro_status` shows non-zero `profile_write_ret` | the EC rejected the upload; the keys stay disabled and nothing breaks. Report the code |
 | `ENODEV` / `EIO` on write | driver could not reach the EC via WMI (query 15 unsupported on this firmware) |

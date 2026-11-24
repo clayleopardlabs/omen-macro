@@ -28,6 +28,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from omen_macro import boot_diag  # noqa: E402
 from omen_macro import codec  # noqa: E402
 from omen_macro import profiles  # noqa: E402
 
@@ -132,8 +133,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         written = write_profile(profile, args.sysfs)
     except FileNotFoundError:
-        print(f"hardware interface not found: {args.sysfs / 'macro_profile'}\n"
-              "The patched hp-wmi module is not loaded - run install.sh.", file=sys.stderr)
+        diagnosis = boot_diag.diagnose_missing_interface(args.sysfs)
+        print(f"hardware interface not found: {args.sysfs / 'macro_profile'}",
+              file=sys.stderr)
+        print(f"reason: {diagnosis.summary}", file=sys.stderr)
+        print(file=sys.stderr)
+        print(diagnosis.hint, file=sys.stderr)
         return 3
     except PermissionError:
         print("permission denied writing macro_profile; run install.sh to grant "

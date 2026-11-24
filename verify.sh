@@ -5,9 +5,13 @@
 #   sudo ./verify.sh
 #
 # Checks, in order:
-#   1. the patched hp-wmi is loaded and exposes the macro interface
-#   2. macro_status reports a successful upload
-#   3. presses on P1..P6 arrive as numpad key codes at the input layer
+#   1. Secure Boot state, the DKMS signing key and the installed module's
+#      signature (a Secure Boot rejection is the usual cause of a missing
+#      macro interface since Secure Boot was enabled from Windows)
+#   2. the patched hp-wmi is loaded and exposes the macro interface, and the
+#      boot service is active
+#   3. macro_status reports a successful upload
+#   4. presses on P1..P6 arrive as numpad key codes at the input layer
 #
 # Note: the macro keys replay real keystrokes, so if the terminal running this
 # script has focus the digits 1..6 will be typed into it.  That is expected and
@@ -16,21 +20,96 @@ set -uo pipefail
 
 SYSFS="/sys/devices/platform/hp-wmi"
 DURATION="${OMEN_MACRO_CAPTURE_SECONDS:-15}"
+MOK_DER="/var/lib/shim-signed/mok/MOK.der"
+DEFAULT_MOK_CN="Omen Secure Boot Module Signature key"
+SVC="omen-macro-apply.service"
 FAILS=0
 FAILED_CHECKS=()
 
 ok()   { printf '  \033[32mPASS\033[0m %s\n' "$*"; }
 bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$*"; }
+warn() { printf '  \033[33mWARN\033[0m %s\n' "$*"; }
 info() { printf '  ---- %s\n' "$*"; }
 fail() { bad "$1"; FAILS=$((FAILS + 1)); FAILED_CHECKS+=("$2"); }
 
-echo "== 1. driver =="
+echo "== 1. Secure Boot / module signature =="
+SB_ENABLED=0
+MOK_OK=0
+if command -v mokutil >/dev/null 2>&1; then
+	SB_STATE="$(mokutil --sb-state 2>&1 || true)"
+	if [[ "${SB_STATE}" == *"SecureBoot enabled"* ]]; then
+		SB_ENABLED=1
+		info "Secure Boot: enabled"
+	elif [[ "${SB_STATE}" == *"SecureBoot disabled"* ]]; then
+		info "Secure Boot: disabled"
+	else
+		info "Secure Boot: unknown (${SB_STATE:-mokutil gave no output})"
+	fi
+else
+	info "Secure Boot: mokutil is not installed, cannot check"
+fi
+
+# The DKMS signing key's CN.  openssl is optional: the fallback is the name
+# every hp-omen-extra 2.1.2 install uses.
+MOK_CN="${DEFAULT_MOK_CN}"
+if [[ -r "${MOK_DER}" ]] && command -v openssl >/dev/null 2>&1; then
+	_CN="$(openssl x509 -inform DER -in "${MOK_DER}" -noout -subject 2>/dev/null \
+		| sed -n 's/^subject=.*CN *= *//p' || true)"
+	if [[ -n "${_CN}" ]]; then MOK_CN="${_CN}"; fi
+fi
+
+MODPATH="$(modinfo -n hp_wmi 2>/dev/null || true)"
+if [[ -n "${MODPATH}" && -f "${MODPATH}" ]]; then
+	SIGNER="$(modinfo -F signer "${MODPATH}" 2>/dev/null || true)"
+	SIGKEY="$(modinfo -F sig_key "${MODPATH}" 2>/dev/null || true)"
+	info "module: ${MODPATH}"
+	if [[ -n "${SIGKEY}" ]]; then
+		info "signer: ${SIGNER} (sig_key ${SIGKEY})"
+	else
+		warn "the installed module carries no signature"
+		if [[ ${SB_ENABLED} -eq 1 ]]; then
+			fail "hp_wmi is unsigned but Secure Boot is enabled - the kernel refuses it" "module signed"
+		fi
+	fi
+else
+	fail "hp_wmi is not installed for $(uname -r) (hp-omen-extra DKMS package missing)" "module signed"
+	info "install it with: sudo ./install.sh"
+fi
+
+if [[ -r "${MOK_DER}" ]]; then
+	info "DKMS key: ${MOK_DER} (CN ${MOK_CN})"
+else
+	info "DKMS key: ${MOK_DER} is missing (DKMS signing not set up)"
+fi
+
+if command -v mokutil >/dev/null 2>&1; then
+	if mokutil --list-new 2>/dev/null | grep -qF -- "${MOK_CN}"; then
+		fail "an MOK enrolment is pending - reboot and confirm it in the blue MOK screen (Enroll MOK -> ...)" "MOK key enrolled"
+	elif mokutil --list-enrolled 2>/dev/null | grep -qF -- "${MOK_CN}"; then
+		MOK_OK=1
+		ok "the DKMS key is enrolled in shim's MOK list"
+	elif [[ ${SB_ENABLED} -eq 1 ]]; then
+		fail "the DKMS key is NOT enrolled, so the kernel rejects hp_wmi (\"Key was rejected by service\")" "MOK key enrolled"
+		echo "       fix: sudo ./fix-secureboot.sh   (then confirm the blue MOK screen at reboot)"
+	else
+		info "the DKMS key is not enrolled (harmless while Secure Boot is off)"
+	fi
+fi
+
+echo
+echo "== 2. driver =="
 if [[ -e "${SYSFS}/macro_profile" && -e "${SYSFS}/macro_status" ]]; then
 	ok "macro_profile and macro_status exist"
 	info "permissions: $(stat -c '%A %U:%G' "${SYSFS}/macro_profile" 2>/dev/null)"
 else
 	bad "macro interface missing - the patched hp-wmi is not loaded"
-	echo "     reboot, then re-run this script"
+	if [[ ${SB_ENABLED} -eq 1 && ${MOK_OK} -eq 0 ]]; then
+		echo "     Secure Boot is enabled and the DKMS key is not enrolled, so the"
+		echo "     kernel rejects the module.  Run:  sudo ./fix-secureboot.sh"
+		echo "     then confirm the enrolment in the blue MOK screen at reboot."
+	else
+		echo "     reboot, then re-run this script (or sudo ./install.sh)"
+	fi
 	exit 1
 fi
 
@@ -41,8 +120,14 @@ else
 	fail "hp_wmi is not loaded" "hp_wmi loaded"
 fi
 
+if systemctl is-active --quiet "${SVC}" 2>/dev/null; then
+	ok "${SVC} is active"
+else
+	fail "${SVC} is not active - the profile is not re-uploaded at boot (systemctl status ${SVC})" "boot service active"
+fi
+
 echo
-echo "== 2. EC upload status =="
+echo "== 3. EC upload status =="
 if [[ -r "${SYSFS}/macro_status" ]]; then
 	STATUS="$(cat "${SYSFS}/macro_status")"
 	printf '%s\n' "${STATUS}" | sed 's/^/     /'
@@ -56,7 +141,7 @@ else
 fi
 
 echo
-echo "== 3. key capture =="
+echo "== 4. key capture =="
 echo "  Press P1, P2, P3, P4, P5, P6 now (${DURATION} seconds)..."
 python3 - "${DURATION}" <<'PY'
 import glob
