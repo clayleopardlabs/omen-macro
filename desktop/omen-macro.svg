@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  OMEN Macro Keys app icon.
+
+  A stylised diamond in the OMEN red/orange gradient on the dark chassis
+  background, matching the branding used in the window itself.  Plain SVG,
+  no external references, so GdkPixbuf/rsvg and the hicolor icon theme can
+  rasterise it at any size.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512"
+     viewBox="0 0 512 512" role="img" aria-label="OMEN Macro Keys">
+  <defs>
+    <linearGradient id="omenMark" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FF5A1F"/>
+      <stop offset="0.55" stop-color="#E4002B"/>
+      <stop offset="1" stop-color="#B30023"/>
+    </linearGradient>
+    <linearGradient id="chassis" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#17171C"/>
+      <stop offset="1" stop-color="#0B0B0E"/>
+    </linearGradient>
+  </defs>
+  <!-- chassis tile with a subtle border, rounded like the app's cards -->
+  <rect x="16" y="16" width="480" height="480" rx="84" fill="url(#chassis)"/>
+  <rect x="17.5" y="17.5" width="477" height="477" rx="82.5"
+        fill="none" stroke="#2A2A33" stroke-width="3"/>
+  <!-- OMEN diamond: an outer mark with a dark interior and a bright core -->
+  <path d="M256 84 L428 256 L256 428 L84 256 Z" fill="url(#omenMark)"/>
+  <path d="M256 140 L372 256 L256 372 L140 256 Z" fill="#0B0B0E"/>
+  <path d="M256 186 L326 256 L256 326 L186 256 Z" fill="url(#omenMark)"/>
+</svg>

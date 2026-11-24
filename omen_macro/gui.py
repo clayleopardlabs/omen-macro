@@ -45,9 +45,11 @@ Files
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
+from string import Template
 
 import gi
 
@@ -104,29 +106,761 @@ Environment:
                      while /etc/omen-macro does not exist)
 """
 
-CSS = """
-.macro-key {
-    font-weight: bold;
+# --------------------------------------------------------------------------- #
+# OEM theme: design tokens + one stylesheet built from them
+#
+# The look is HP's OMEN Gaming Hub: near-black chassis, a slightly raised
+# sidebar with uppercase icon navigation and a red selection bar, dark cards
+# with 1px borders and 10px corners, uppercase dim section labels, white/gray
+# type hierarchy, OMEN red for the brand and primary actions, amber/green only
+# for state.  Every colour below is a token so tests, the renderer and the
+# docs can measure contrast against the real palette.
+#
+# Deliberately no `opacity` on text: GTK's Adwaita-derived `.dim-label`
+# (opacity 0.55) renders double-struck in the offscreen paint path and makes
+# contrast unpredictable, so secondary text uses an explicit token colour
+# (.text-dim / .hint) instead.  The stylesheet is explicit enough to override
+# the user's WhiteSur-Dark desktop theme for every widget we ship.
+# --------------------------------------------------------------------------- #
+THEME: dict[str, str] = {
+    # chassis
+    "bg": "#0B0B0E",
+    "bg_raised": "#121216",
+    "surface": "#17171C",
+    "surface_hover": "#1E1E24",
+    "surface_active": "#24242C",
+    "border": "#2A2A33",
+    "border_strong": "#3A3A46",
+    # type
+    "text": "#F4F4F7",
+    "text_dim": "#A6A6B2",
+    "text_faint": "#6C6C7A",
+    # brand and state
+    "omen": "#E4002B",
+    "omen_hot": "#FF2D4B",
+    "amber": "#F5B31E",
+    "green": "#43D17C",
+    "error": "#FF4D6A",
+    "focus": "#E4002B",
 }
+
+FONT_STACK = "Ubuntu Sans, Ubuntu, Cantarell, Sans"
+MONO_STACK = "Ubuntu Mono, DejaVu Sans Mono, Monospace"
+
+
+def _tint(color: str, alpha: float) -> str:
+    """'#E4002B', 0.16 -> 'rgba(228, 0, 43, 0.16)' for translucent accents."""
+    value = color.lstrip("#")
+    red, green, blue = (int(value[i:i + 2], 16) for i in (0, 2, 4))
+    return f"rgba({red}, {green}, {blue}, {alpha})"
+
+
+_CSS_VARS = {
+    **THEME,
+    "font": FONT_STACK,
+    "mono": MONO_STACK,
+    "omen_tint": _tint(THEME["omen"], 0.16),
+    "omen_line": _tint(THEME["omen_hot"], 0.55),
+    "focus_ring": _tint(THEME["focus"], 0.9),
+    "error_tint": _tint(THEME["error"], 0.14),
+    "error_line": _tint(THEME["error"], 0.55),
+    "amber_tint": _tint(THEME["amber"], 0.12),
+    "amber_line": _tint(THEME["amber"], 0.45),
+    "green_tint": _tint(THEME["green"], 0.10),
+    "green_line": _tint(THEME["green"], 0.55),
+}
+
+_CSS_TEMPLATE = Template("""
+/* ---------------------------------------------------------------- chassis */
+window {
+    background-color: $bg;
+    background-image: none;
+    color: $text;
+    font-family: $font;
+    font-size: 13px;
+}
+window.omen-dialog {
+    background-color: $bg;
+}
+
+/* Headerbar: flat near-black band, thin bottom rule, no WhiteSur gloss. */
+headerbar {
+    background-color: $bg;
+    background-image: none;
+    border-bottom: 1px solid $border;
+    box-shadow: none;
+    min-height: 46px;
+    padding: 0 10px;
+    color: $text;
+}
+headerbar .title {
+    color: $text;
+    font-weight: 700;
+    letter-spacing: 0.8px;
+}
+headerbar button {
+    background-color: transparent;
+    background-image: none;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    color: $text_dim;
+    min-height: 22px;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.6px;
+    box-shadow: none;
+    text-shadow: none;
+}
+headerbar button:hover {
+    background-color: $surface_hover;
+    color: $text;
+}
+headerbar button.ghost {
+    border-color: $border;
+}
+headerbar button.ghost:hover {
+    border-color: $border_strong;
+    color: $text;
+}
+/* Keep the CSD window controls: the base `headerbar button` padding would
+   clip their 16px symbolic icons, so give them their own compact box. */
+windowcontrols button {
+    background: none;
+    background-color: transparent;
+    border: none;
+    border-radius: 4px;
+    padding: 0;
+    margin: 0 1px;
+    min-width: 24px;
+    min-height: 24px;
+    box-shadow: none;
+}
+windowcontrols button:hover {
+    background-color: $surface_hover;
+}
+windowcontrols button image {
+    color: $text_dim;
+    -gtk-icon-size: 16px;
+}
+windowcontrols button:hover image { color: $text; }
+windowcontrols button:focus {
+    outline: 2px solid $focus;
+    outline-offset: 1px;
+}
+
+/* Labels inherit their colour from the widget they sit in; do not paint all
+   labels white or every ghost/secondary label loses its token colour. */
+.ghost label { color: $text_dim; }
+.ghost:hover label { color: $text; }
+.record label { color: $omen_hot; }
+button.suggested-action label,
+button.destructive-action label,
+.primary label { color: #FFFFFF; }
+.record.destructive-action label { color: #FFFFFF; }
+
+/* ------------------------------------------------------------- type roles */
+.text-dim { color: $text_dim; }
+.text-faint { color: $text_faint; }
+.eyebrow {
+    color: $text_dim;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 1.8px;
+}
+.hint {
+    color: $text_dim;
+    font-size: 12px;
+}
+.page-title {
+    color: $text;
+    font-size: 19px;
+    font-weight: 800;
+    letter-spacing: 1.2px;
+}
+.page-subtitle {
+    color: $text_dim;
+    font-size: 12px;
+}
+.row-label {
+    color: $text;
+    font-size: 12px;
+    font-weight: 600;
+}
+
+/* ---------------------------------------------------------------- brand */
+.brand-mark {
+    color: $omen_hot;
+    font-size: 20px;
+    text-shadow: 0 0 10px $omen_line;
+}
+.brand-omen {
+    color: $text;
+    font-size: 15px;
+    font-weight: 800;
+    letter-spacing: 3px;
+}
+.brand-sub {
+    color: $text_dim;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 2px;
+}
+.brand-divider {
+    background-color: $border_strong;
+    min-width: 1px;
+    min-height: 18px;
+}
+.device-pill {
+    background-color: $surface;
+    border: 1px solid $border;
+    border-radius: 999px;
+    padding: 2px 10px;
+}
+.device-dot { color: $text_faint; -gtk-icon-size: 8px; }
+.device-dot.ok { color: $green; }
+.device-dot.warn { color: $amber; }
+.device-text {
+    color: $text_dim;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 1px;
+}
+
+/* -------------------------------------------------------------- sidebar */
+.sidebar {
+    background-color: $bg_raised;
+    border-right: 1px solid $border;
+    padding: 12px 8px;
+}
+.nav-item {
+    background-color: transparent;
+    background-image: none;
+    border: 1px solid transparent;
+    border-left: 2px solid transparent;
+    border-radius: 6px;
+    padding: 8px 10px;
+    min-height: 30px;
+    box-shadow: none;
+    text-shadow: none;
+}
+.nav-item:hover {
+    background-color: $surface_hover;
+    background-image: none;
+    border-left-color: $border_strong;
+}
+.nav-item:active,
+.nav-item:checked,
+.nav-item:checked:hover {
+    background-color: $surface_active;
+    background-image: none;
+    border-left-color: $omen;
+    box-shadow: none;
+    text-shadow: none;
+}
+.nav-item label {
+    color: $text_dim;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 1.5px;
+}
+.nav-item:hover label { color: $text; }
+.nav-item:checked label { color: $text; }
+.nav-item image { color: $text_faint; -gtk-icon-size: 16px; }
+.nav-item:hover image { color: $text_dim; }
+.nav-item:checked image { color: $omen_hot; }
+.nav-item:focus,
+.nav-item:focus-visible {
+    outline: 2px solid $focus;
+    outline-offset: 1px;
+}
+.sidebar-foot { padding: 8px 6px 2px 6px; }
+.side-device {
+    color: $text_dim;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 1px;
+}
+
+/* ---------------------------------------------------------------- cards */
+.card {
+    background-color: $surface;
+    border: 1px solid $border;
+    border-radius: 10px;
+}
+.card-header {
+    padding: 9px 14px;
+    border-bottom: 1px solid $border;
+}
+.card-chevron {
+    color: $text_faint;
+    -gtk-icon-size: 12px;
+}
+.card-title {
+    color: $text_dim;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 1.8px;
+}
+.card-tail {
+    color: $text_dim;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 1px;
+}
+.card-body { padding: 4px 12px 10px 12px; }
+
+/* ----------------------------------------------------------------- rows */
+list {
+    background-color: transparent;
+    background-image: none;
+    border: none;
+}
+list row { background-color: transparent; }
+.macro-row { border-bottom: 1px solid $border; }
+.macro-row:last-child { border-bottom: none; }
+.macro-row:hover { background-color: $surface_hover; }
 .macro-row.recording {
-    background-color: rgba(255, 163, 72, 0.22);
-    border: 2px solid rgba(255, 163, 72, 0.85);
-    border-radius: 6px;
+    background-color: $omen_tint;
+    border-left: 2px solid $omen;
 }
-.banner {
-    padding: 6px 10px;
+.key-badge {
+    background-color: $surface_hover;
+    border: 1px solid $border_strong;
     border-radius: 6px;
+    color: $text;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 0.6px;
+}
+.omen-key-badge {
+    font-size: 9px;
+    letter-spacing: 0.4px;
+}
+.key-prefix {
+    color: $text_dim;
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: 0.8px;
+}
+.macro-row.has-command .key-badge {
+    border-color: $amber_line;
+    color: $amber;
+}
+.macro-row.recording .key-badge {
+    border-color: $omen;
+    color: $omen_hot;
+}
+.macro-summary {
+    color: $text_dim;
+    font-family: $mono;
+    font-size: 12px;
+}
+.macro-summary.is-empty {
+    color: $text_dim;
+    font-style: italic;
+}
+.rule-row { border-bottom: 1px solid $border; }
+.rule-row:last-child { border-bottom: none; }
+.rule-row:hover { background-color: $surface_hover; }
+
+/* -------------------------------------------------------------- buttons */
+button {
+    background-color: transparent;
+    background-image: none;
+    border: 1px solid $border;
+    border-radius: 6px;
+    color: $text;
+    padding: 4px 10px;
+    min-height: 26px;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.4px;
+    box-shadow: none;
+    text-shadow: none;
+}
+button:hover {
+    background-color: $surface_hover;
+    border-color: $border_strong;
+}
+button:active,
+button:checked {
+    background-color: $surface_active;
+    background-image: none;
+    box-shadow: none;
+    text-shadow: none;
+}
+button:disabled {
+    color: $text_faint;
+    border-color: $border;
+    background-color: transparent;
+}
+button:focus,
+button:focus-visible {
+    outline: 2px solid $focus;
+    outline-offset: 1px;
+}
+.macro-row button {
+    min-height: 24px;
+    padding: 3px 9px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+}
+.macro-row .ghost {
+    border-color: $border_strong;
+    color: $text_dim;
+}
+.macro-row .ghost:hover {
+    border-color: $text_faint;
+    color: $text;
+    background-color: $surface_hover;
+}
+.ghost {
+    background-color: transparent;
+    background-image: none;
+    border: 1px solid $border;
+    color: $text_dim;
+    box-shadow: none;
+}
+.ghost:hover {
+    background-color: $surface_hover;
+    border-color: $border_strong;
+    color: $text;
+}
+.ghost:active { background-color: $surface_active; }
+.ghost.danger:hover {
+    border-color: $omen;
+    color: $text;
+    background-color: $omen_tint;
+}
+.primary,
+button.suggested-action {
+    background-color: $omen;
+    background-image: none;
+    border: 1px solid $omen;
+    color: #FFFFFF;
+}
+.primary:hover,
+button.suggested-action:hover {
+    background-color: $omen_hot;
+    border-color: $omen_hot;
+}
+button.destructive-action {
+    background-color: $omen;
+    background-image: none;
+    border: 1px solid $omen;
+    color: #FFFFFF;
+}
+button.destructive-action:hover {
+    background-color: $omen_hot;
+    border-color: $omen_hot;
+}
+/* The Record button is an outline until it is the active action. */
+.record {
+    background-color: transparent;
+    background-image: none;
+    border: 1px solid $omen;
+    color: $omen_hot;
+}
+.record:hover { background-color: $omen_tint; border-color: $omen_hot; }
+.record.destructive-action {
+    background-color: $omen;
+    border-color: $omen;
+    color: #FFFFFF;
+}
+
+/* ------------------------------------------------------- inputs / controls */
+entry {
+    background-color: $bg_raised;
+    background-image: none;
+    border: 1px solid $text_faint;
+    border-radius: 4px;
+    color: $text;
+    padding: 4px 8px;
+    caret-color: $omen_hot;
+}
+entry:hover { border-color: $text_faint; }
+entry:focus,
+entry:focus-within,
+entry:focus:focus-visible {
+    border-color: $focus;
+    outline: 2px solid $focus;
+    outline-offset: 1px;
+    box-shadow: none;
+}
+entry:disabled { color: $text_faint; }
+entry placeholder { color: $text_dim; }
+selection,
+entry selection {
+    background-color: $omen;
+    color: #FFFFFF;
+}
+spinbutton {
+    background-color: $bg_raised;
+    background-image: none;
+    border: 1px solid $text_faint;
+    border-radius: 4px;
+    color: $text;
+}
+spinbutton entry {
+    border: none;
+    background: transparent;
+}
+spinbutton button {
+    background: transparent;
+    border: none;
+    min-width: 16px;
+    padding: 0;
+    color: $text_dim;
+}
+spinbutton:focus,
+spinbutton:focus-within { outline: 2px solid $focus; outline-offset: 1px; }
+combobox button {
+    background-color: $bg_raised;
+    background-image: none;
+    border: 1px solid $text_faint;
+    border-radius: 6px;
+    color: $text;
+    padding: 4px 10px;
+    min-height: 28px;
+    font-size: 12px;
+    font-weight: 600;
+    box-shadow: none;
+    text-shadow: none;
+}
+combobox button:hover {
+    border-color: $border_strong;
+    background-color: $surface_hover;
+}
+combobox button:focus,
+combobox button:focus-visible {
+    outline: 2px solid $focus;
+    outline-offset: 1px;
+    border-color: $focus;
+    box-shadow: none;
+}
+/* The user's theme paints the dropdown arrow as a blue rounded badge; the
+   OEM look is a plain dim chevron, so neutralise the element strongly. */
+arrow {
+    background: none;
+    background-color: transparent;
+    background-image: none;
+    border: none;
+    box-shadow: none;
+    -gtk-icon-shadow: none;
+    color: $text_dim;
+}
+combobox arrow,
+combobox button arrow,
+combobox:focus-within arrow,
+combobox button:focus arrow {
+    background: none;
+    background-color: transparent;
+    background-image: none;
+    border: none;
+    box-shadow: none;
+    -gtk-icon-shadow: none;
+    color: $text_dim;
+}
+popover > contents {
+    background-color: $surface;
+    border: 1px solid $border_strong;
+    border-radius: 8px;
+    padding: 4px;
+}
+popover listview row { padding: 4px 8px; border-radius: 4px; }
+popover listview row:hover { background-color: $surface_hover; }
+checkbutton { color: $text; }
+checkbutton check {
+    background-color: $bg_raised;
+    background-image: none;
+    border: 1px solid $text_faint;
+    border-radius: 4px;
+    box-shadow: none;
+    min-width: 16px;
+    min-height: 16px;
+}
+checkbutton check:hover { border-color: $border_strong; }
+checkbutton check:checked {
+    background-color: $omen;
+    background-image: none;
+    border-color: $omen;
+    color: #FFFFFF;
+    box-shadow: none;
+}
+checkbutton:focus,
+checkbutton:focus-visible {
+    outline: 2px solid $focus;
+    outline-offset: 1px;
+}
+switch {
+    background-color: $surface_hover;
+    border: 1px solid $border_strong;
+    border-radius: 999px;
+}
+switch:checked {
+    background-color: $omen;
+    border-color: $omen;
+}
+switch slider {
+    background-color: $text;
+    border-radius: 999px;
+    min-width: 16px;
+    min-height: 16px;
+}
+switch:focus,
+switch:focus-visible {
+    outline: 2px solid $focus;
+    outline-offset: 2px;
+}
+expander-widget,
+.omen-expander { color: $text_dim; }
+expander-widget > title,
+.omen-expander > title {
+    color: $text_dim;
+    font-size: 12px;
+    font-weight: 700;
+}
+expander-widget > title:hover,
+.omen-expander:hover > title,
+.omen-expander:hover { color: $text; }
+
+/* ------------------------------------------------------- banners / pills */
+.banner {
+    padding: 8px 12px;
+    border-radius: 6px;
+    border: 1px solid transparent;
+    font-size: 12px;
 }
 .banner.banner-error {
-    background-color: rgba(224, 27, 36, 0.18);
+    background-color: $error_tint;
+    border-color: $error_line;
+    color: $text;
 }
 .banner.banner-warning {
-    background-color: rgba(229, 165, 10, 0.20);
+    background-color: $amber_tint;
+    border-color: $amber_line;
+    color: $text;
+}
+.pill {
+    border: 1px solid $border_strong;
+    border-radius: 999px;
+    padding: 2px 9px;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 0.8px;
+    color: $text_dim;
+}
+.pill-dot {
+    -gtk-icon-size: 8px;
+    color: $text_faint;
+}
+.pill-dot.ok { color: $green; }
+.pill-dot.warn { color: $amber; }
+.pill-dot.off { color: $text_faint; }
+.pill.ok {
+    color: $green;
+    border-color: $green_line;
+    background-color: $green_tint;
+}
+.pill.warn {
+    color: $amber;
+    border-color: $amber_line;
+    background-color: $amber_tint;
+}
+.pill.off {
+    color: $text_dim;
+    border-color: $border;
+    background-color: $surface;
+}
+
+/* -------------------------------------------------------------- dialogs */
+.dialog-body { background-color: $bg; }
+.dialog-title {
+    color: $text;
+    font-size: 13px;
+    font-weight: 800;
+    letter-spacing: 1.4px;
+}
+.dialog-heading {
+    color: $text_dim;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 1.8px;
+}
+.dialog-accent {
+    background-color: $omen;
+    border-radius: 999px;
+    min-height: 2px;
+}
+
+/* --------------------------------------------------------- surfaces / bars */
+scrolledwindow { background-color: transparent; }
+viewport { background-color: transparent; }
+.content-area { background-color: $bg; }
+.status-bar {
+    background-color: $bg_raised;
+    border-top: 1px solid $border;
+    padding: 7px 14px;
 }
 .status {
-    font-family: monospace;
+    color: $text_dim;
+    font-family: $mono;
+    font-size: 11px;
 }
-"""
+.footer-bar {
+    background-color: $bg;
+    border-top: 1px solid $border;
+    padding: 8px 14px;
+}
+separator { background-color: $border; min-height: 1px; min-width: 1px; }
+""")
+
+CSS = _CSS_TEMPLATE.substitute(_CSS_VARS)
+_CSS_INSTALLED = False
+
+
+def install_css() -> None:
+    """Install the OEM stylesheet once and force the dark widget theme.
+
+    Called from ``MacroApp._install_css()`` and again, harmlessly, when a
+    ``MacroWindow`` is built directly (tests, renderers): the look must not
+    depend on which entry point constructed the window.  Safe without a
+    display - it then only flips the module flag.
+    """
+    global _CSS_INSTALLED
+    if _CSS_INSTALLED:
+        return
+    _CSS_INSTALLED = True
+    settings = Gtk.Settings.get_default()
+    if settings is not None:
+        try:
+            # One explicit call: the palette assumes a dark base and the user's
+            # desktop theme is WhiteSur-Dark-solid.
+            settings.set_property("gtk-application-prefer-dark-theme", True)
+        except (AttributeError, TypeError):
+            pass
+        try:
+            # Pin the widget theme for this process only.  WhiteSur draws the
+            # window buttons as macOS traffic-light PNGs and injects its blue
+            # accent into dropdowns/lists; Adwaita gives standard symbolic
+            # window controls and a neutral base, and everything above it is
+            # our own stylesheet.  A user running a high-contrast theme keeps
+            # it: our dark palette is the wrong choice for them.
+            current = str(settings.get_property("gtk-theme-name") or "")
+            if "contrast" not in current.lower():
+                settings.set_property("gtk-theme-name", "Adwaita")
+        except (AttributeError, TypeError):
+            pass
+    display = Gdk.Display.get_default()
+    if display is None:
+        return
+    provider = Gtk.CssProvider()
+    provider.load_from_string(CSS)
+    Gtk.StyleContext.add_provider_for_display(
+        display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -372,6 +1106,8 @@ class MacroWindow(Gtk.ApplicationWindow):
         self._refresh_omen_status()
         self._refresh_auto_status()
         diagnosis = self._hardware_diagnosis()
+        self._diagnosis = diagnosis
+        self._set_device_state(diagnosis is None)
         lines = [
             self._device_line(diagnosis),
             self._profile_line(),
@@ -381,47 +1117,315 @@ class MacroWindow(Gtk.ApplicationWindow):
             lines += ["", diagnosis.hint]
             self._set_banner(f"{MSG_NO_HW} - {diagnosis.summary}", "banner-error")
         self._set_status("\n".join(lines))
+        self._refresh_ec_state()
 
     # -- construction ------------------------------------------------------
     def _build_ui(self) -> None:
-        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        for side in ("top", "bottom", "start", "end"):
-            getattr(root, f"set_margin_{side}")(12)
+        install_css()
+        self.set_titlebar(self._build_titlebar())
+
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.stack.set_transition_duration(120)
+        self.stack.set_hexpand(True)
+        self.stack.set_vexpand(True)
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        root.add_css_class("app-root")
+        root.append(self._build_content())
+        root.append(self._build_status_area())
+        root.append(self._build_footer())
         self.set_child(root)
 
-        scroller = Gtk.ScrolledWindow()
-        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        scroller.set_vexpand(True)
-        scroller.set_child(self._build_content())
-        root.append(scroller)
+    def _build_content(self) -> Gtk.Widget:
+        """Sidebar plus the two stacked pages; the bars are added by _build_ui."""
+        body = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        body.set_vexpand(True)
+        body.append(self._build_sidebar())
+        body.append(self._build_main_area())
+        return body
+
+    # -- titlebar / brand --------------------------------------------------
+    def _build_titlebar(self) -> Gtk.Widget:
+        header = Gtk.HeaderBar()
+        header.add_css_class("omen-titlebar")
+        # The brand block is the title: an empty title widget stops GTK from
+        # printing "OMEN Macro Keys" in the middle of the bar as well.
+        header.set_title_widget(Gtk.Box())
+        header.pack_start(self._brand_box())
+
+        right = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        right.set_valign(Gtk.Align.CENTER)
+        right.append(self._build_profile_row())
+        right.append(self._device_pill())
+        header.pack_end(right)
+        return header
+
+    def _brand_box(self) -> Gtk.Widget:
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        box.set_valign(Gtk.Align.CENTER)
+        # U+25C6 BLACK DIAMOND is present in the Ubuntufont stack and verified
+        # in the offscreen renders; the other glyphs are symbolic icons.
+        mark = Gtk.Label(label="◆")
+        mark.add_css_class("brand-mark")
+        mark.set_valign(Gtk.Align.CENTER)
+        mark.set_tooltip_text("OMEN")
+        box.append(mark)
+        wordmark = Gtk.Label(label="OMEN")
+        wordmark.add_css_class("brand-omen")
+        wordmark.set_valign(Gtk.Align.CENTER)
+        box.append(wordmark)
+        divider = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        divider.add_css_class("brand-divider")
+        divider.set_margin_start(4)
+        divider.set_margin_end(4)
+        box.append(divider)
+        sub = Gtk.Label(label="MACRO KEYS")
+        sub.add_css_class("brand-sub")
+        sub.set_valign(Gtk.Align.CENTER)
+        box.append(sub)
+        return box
+
+    @staticmethod
+    def _device_label() -> str:
+        """'OMEN 17 · 8BAD' from DMI, or plain 'OMEN' when it is unreadable."""
+        board = ""
+        product = ""
+        try:
+            board = Path("/sys/class/dmi/id/board_name").read_text().strip()
+        except OSError:
+            board = ""
+        try:
+            product = Path("/sys/class/dmi/id/product_name").read_text().strip()
+        except OSError:
+            product = ""
+        match = re.search(r"\b(\d{2})\b", product)
+        name = f"OMEN {match.group(1)}" if match else "OMEN"
+        return f"{name} · {board}" if board else name
+
+    def _device_pill(self) -> Gtk.Widget:
+        pill = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        pill.add_css_class("device-pill")
+        pill.set_valign(Gtk.Align.CENTER)
+        self.device_dot = Gtk.Image.new_from_icon_name("media-record-symbolic")
+        self.device_dot.add_css_class("device-dot")
+        self.device_dot.add_css_class("ok")
+        self.device_dot.set_valign(Gtk.Align.CENTER)
+        pill.append(self.device_dot)
+        label = Gtk.Label(label=self._device_label(), xalign=0)
+        label.add_css_class("device-text")
+        pill.append(label)
+        pill.set_tooltip_text(self._device_line())
+        self.device_pill = pill
+        return pill
+
+    def _set_device_state(self, present: bool) -> None:
+        """Green dot only when the EC interface exists; amber when missing.
+
+        The sidebar pill carries the textual state, so the titlebar never
+        relies on colour alone and cannot claim green for absent hardware.
+        """
+        dot = getattr(self, "device_dot", None)
+        if dot is not None:
+            for name in ("ok", "warn"):
+                dot.remove_css_class(name)
+            dot.add_css_class("ok" if present else "warn")
+        pill = getattr(self, "device_pill", None)
+        if pill is not None:
+            pill.set_tooltip_text(self._device_line())
+            self._set_accessible_label(
+                pill,
+                f"Device {self._device_label()}: "
+                + ("hardware interface present" if present
+                   else "hardware interface missing"))
+
+    # -- sidebar -----------------------------------------------------------
+    def _build_sidebar(self) -> Gtk.Widget:
+        sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        sidebar.add_css_class("sidebar")
+        sidebar.set_size_request(196, -1)
+        sidebar.set_valign(Gtk.Align.FILL)
+
+        nav_label = Gtk.Label(label="NAVIGATION", xalign=0)
+        nav_label.add_css_class("eyebrow")
+        nav_label.set_margin_start(8)
+        nav_label.set_margin_bottom(4)
+        sidebar.append(nav_label)
+
+        self.nav_macros = self._nav_item(
+            "MACROS", "input-keyboard-symbolic", "macros")
+        self.nav_auto = self._nav_item(
+            "AUTO-SWITCH", "applications-system-symbolic", "auto")
+        self.nav_auto.set_group(self.nav_macros)
+        sidebar.append(self.nav_macros)
+        sidebar.append(self.nav_auto)
+
+        spacer = Gtk.Box()
+        spacer.set_vexpand(True)
+        sidebar.append(spacer)
+
+        separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        separator.set_margin_top(6)
+        separator.set_margin_bottom(2)
+        sidebar.append(separator)
+
+        foot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        foot.add_css_class("sidebar-foot")
+        device = Gtk.Label(label=self._device_label(), xalign=0)
+        device.add_css_class("side-device")
+        device.set_ellipsize(Pango.EllipsizeMode.END)
+        foot.append(device)
+        ec_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        ec_label = Gtk.Label(label="EC STATUS", xalign=0)
+        ec_label.add_css_class("eyebrow")
+        ec_row.append(ec_label)
+        self.ec_dot = Gtk.Image.new_from_icon_name("media-record-symbolic")
+        self.ec_dot.add_css_class("pill-dot")
+        self.ec_dot.add_css_class("off")
+        self.ec_dot.set_valign(Gtk.Align.CENTER)
+        ec_row.append(self.ec_dot)
+        self.ec_pill = Gtk.Label(label="NOT APPLIED")
+        self.ec_pill.add_css_class("pill")
+        self.ec_pill.add_css_class("off")
+        self.ec_pill.set_valign(Gtk.Align.CENTER)
+        ec_row.append(self.ec_pill)
+        foot.append(ec_row)
+        sidebar.append(foot)
+        return sidebar
+
+    def _nav_item(self, label: str, icon_name: str, page: str) -> Gtk.Widget:
+        """One uppercase sidebar navigation entry, OEM style."""
+        button = Gtk.ToggleButton()
+        button.add_css_class("nav-item")
+        button.set_tooltip_text(f"Show the {label.lower()} page")
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        icon = Gtk.Image.new_from_icon_name(icon_name)
+        row.append(icon)
+        # No hexpand here: GTK propagates a child's expand flag up the whole
+        # ancestor chain, which made the fixed-width sidebar grow instead of
+        # the content area. The vertical box already fills children to width.
+        text = Gtk.Label(label=label, xalign=0)
+        row.append(text)
+        button.set_child(row)
+        button.connect("toggled",
+                       lambda btn, p=page: self._on_nav_toggled(btn, p))
+        try:  # the child box hides the label from assistive tech otherwise
+            button.update_property(
+                [Gtk.AccessibleProperty.LABEL], [label.title()])
+        except (AttributeError, TypeError):
+            pass
+        return button
+
+    def _on_nav_toggled(self, button: Gtk.ToggleButton, page: str) -> None:
+        if not button.get_active():
+            return
+        stack = getattr(self, "stack", None)
+        if stack is not None:
+            stack.set_visible_child_name(page)
+
+    # -- pages -------------------------------------------------------------
+    def _build_main_area(self) -> Gtk.Widget:
+        main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        main.add_css_class("content-area")
+        main.set_hexpand(True)
+        main.set_vexpand(True)
 
         self.banner = Gtk.Label(label="", xalign=0)
         self.banner.set_wrap(True)
         self.banner.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
         self.banner.set_selectable(True)
         self.banner.add_css_class("banner")
+        self.banner.set_margin_top(12)
+        self.banner.set_margin_start(20)
+        self.banner.set_margin_end(20)
         self.banner.set_visible(False)
-        root.append(self.banner)
+        main.append(self.banner)
 
-        root.append(self._build_status_area())
-        root.append(self._build_footer())
+        main.append(self.stack)
+        self.stack.add_named(
+            self._page_scroller(self._build_macros_page()), "macros")
+        self.stack.add_named(
+            self._page_scroller(self._build_auto_page()), "auto")
+        self.stack.set_visible_child_name("macros")
+        self.stack.connect("notify::visible-child", self._on_stack_page_changed)
+        self.nav_macros.set_active(True)
+        return main
 
-    def _build_content(self) -> Gtk.Widget:
-        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+    def _on_stack_page_changed(self, stack: Gtk.Stack, _param) -> None:
+        """Keep the sidebar selection in step with the page (renderers/tests
+        switch the stack directly, so the nav must follow it too)."""
+        name = stack.get_visible_child_name()
+        current = {"macros": self.nav_macros, "auto": self.nav_auto}.get(name)
+        if current is not None and not current.get_active():
+            current.set_active(True)
 
-        title = Gtk.Label(label=WINDOW_TITLE, xalign=0)
-        title.add_css_class("title-2")
-        content.append(title)
+    @staticmethod
+    def _page_scroller(page: Gtk.Widget) -> Gtk.Widget:
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_vexpand(True)
+        scroller.set_hexpand(True)
+        scroller.set_child(page)
+        return scroller
 
-        subtitle = Gtk.Label(xalign=0)
-        subtitle.set_wrap(True)
-        subtitle.add_css_class("dim-label")
-        subtitle.set_text(
+    @staticmethod
+    def _page() -> Gtk.Box:
+        """Padded page body used inside each stack page's scroller."""
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(page, f"set_margin_{side}")(20)
+        page.set_hexpand(True)
+        return page
+
+    @staticmethod
+    def _page_head(title: str, subtitle: str) -> Gtk.Widget:
+        head = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        label = Gtk.Label(label=title.upper(), xalign=0)
+        label.add_css_class("page-title")
+        head.append(label)
+        hint = Gtk.Label(label=subtitle, xalign=0)
+        hint.set_wrap(True)
+        hint.add_css_class("page-subtitle")
+        head.append(hint)
+        return head
+
+    def _card(self, title: str | None, body: Gtk.Widget,
+              tail: str = "") -> Gtk.Widget:
+        """Dark panel: uppercase dim header, thin border, 10px radius."""
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        card.add_css_class("card")
+        card.set_hexpand(True)
+        if title:
+            header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            header.add_css_class("card-header")
+            chevron = Gtk.Image.new_from_icon_name("pan-end-symbolic")
+            chevron.add_css_class("card-chevron")
+            chevron.set_valign(Gtk.Align.CENTER)
+            header.append(chevron)
+            label = Gtk.Label(label=title.upper(), xalign=0)
+            label.add_css_class("card-title")
+            header.append(label)
+            if tail:
+                spacer = Gtk.Box()
+                spacer.set_hexpand(True)
+                header.append(spacer)
+                tail_label = Gtk.Label(label=tail.upper(), xalign=1)
+                tail_label.add_css_class("card-tail")
+                header.append(tail_label)
+            card.append(header)
+        surface = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        surface.add_css_class("card-body")
+        surface.append(body)
+        card.append(surface)
+        return card
+
+    def _build_macros_page(self) -> Gtk.Widget:
+        page = self._page()
+        page.append(self._page_head(
+            "Macro keys",
             "Each macro key replays a macro stored in the embedded controller. "
-            "Recording keeps key order only; keys held together count as one chord."
-        )
-        content.append(subtitle)
-        content.append(self._build_profile_row())
+            "Recording keeps key order only; keys held together count as one "
+            "chord."))
 
         warning = Gtk.Label(xalign=0)
         warning.set_wrap(True)
@@ -432,46 +1436,69 @@ class MacroWindow(Gtk.ApplicationWindow):
             "media/ACPI keys. Use the modifier slots for Ctrl/Alt/Shift/Fn "
             "combinations (they are not recorded as part of a chord)."
         )
-        content.append(warning)
-
-        content.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+        page.append(warning)
 
         main_list = Gtk.ListBox()
         main_list.set_selection_mode(Gtk.SelectionMode.NONE)
-        main_list.set_show_separators(True)
+        main_list.set_show_separators(False)
         for slot in codec.PRIMARY_SLOTS:
             self._add_row(main_list, slot, with_command=True)
         self._add_omen_row(main_list)
-        content.append(main_list)
+        page.append(self._card("MACRO KEYS", main_list,
+                               tail="P1 - P6 + OMEN"))
 
-        content.append(self._build_spacing_row())
-        content.append(self._build_advanced())
-        content.append(self._build_auto_section())
-        return content
+        page.append(self._card("TIMING", self._build_spacing_row(),
+                               tail="AUTO-APPLIED"))
+        page.append(self._card("ADVANCED", self._build_advanced(),
+                               tail="CTRL / ALT / SHIFT / FN"))
+        return page
+
+    def _build_auto_page(self) -> Gtk.Widget:
+        page = self._page()
+        page.append(self._page_head(
+            "Auto-switch",
+            "Optional background service: when a mapped app gets focus, its "
+            "profile is applied."))
+        page.append(self._card("PROFILE RULES", self._build_auto_section(),
+                               tail="OPTIONAL"))
+        return page
 
     def _add_row(self, listbox: Gtk.ListBox, slot: str,
                  with_command: bool = False) -> None:
-        """Append one [name | summary | Record | Keys | Edit | Cmd? | Clear] row."""
+        """Append one [badge | summary | Record | Keys | Edit | Cmd? | Clear]."""
         row = Gtk.ListBoxRow()
         row.add_css_class("macro-row")
 
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        for side in ("top", "bottom", "start", "end"):
-            getattr(box, f"set_margin_{side}")(4)
+        box.set_margin_top(6)
+        box.set_margin_bottom(6)
+        box.set_margin_start(6)
+        box.set_margin_end(2)
 
-        name_label = Gtk.Label(label=slot, xalign=0)
-        name_label.add_css_class("macro-key")
-        name_label.set_size_request(96, -1)
+        key_prefix = ""
+        key_text = slot
+        if "+" in slot:
+            key_prefix, key_text = slot.split("+", 1)
+        name_label = Gtk.Label(label=key_text)
+        name_label.add_css_class("key-badge")
+        name_label.set_size_request(44, 34)
+        name_label.set_xalign(0.5)
+        name_label.set_valign(Gtk.Align.CENTER)
 
         summary = Gtk.Label(label="empty", xalign=0)
         summary.set_hexpand(True)
         summary.set_ellipsize(Pango.EllipsizeMode.END)
+        summary.add_css_class("macro-summary")
+        summary.add_css_class("is-empty")
+        summary.set_valign(Gtk.Align.CENTER)
 
         record = Gtk.Button(label="Record")
+        record.add_css_class("record")
         record.set_tooltip_text(f"Record the keystrokes the EC replays for {slot}")
         record.connect("clicked", lambda _btn, s=slot: self._on_record_clicked(s))
 
         keys = Gtk.Button(label="Keys")
+        keys.add_css_class("ghost")
         keys.set_tooltip_text(
             f"Type {slot}'s keys in by hand (for shortcuts the system "
             "grabs before recording can see them, like Ctrl+Alt+T)"
@@ -479,17 +1506,26 @@ class MacroWindow(Gtk.ApplicationWindow):
         keys.connect("clicked", lambda _btn, s=slot: self._open_keys_dialog(s))
 
         edit = Gtk.Button(label="Edit")
+        edit.add_css_class("ghost")
         edit.set_tooltip_text(
             f"Edit {slot} step by step - fix a mis-recorded chord, "
             "insert/delete steps, retype a step"
         )
         edit.connect("clicked", lambda _btn, s=slot: self._open_macro_editor(s))
 
-        widgets: list[Gtk.Widget] = [name_label, summary, record, keys, edit]
+        widgets: list[Gtk.Widget] = []
+        if key_prefix:
+            prefix = Gtk.Label(label=key_prefix.upper(), xalign=1)
+            prefix.add_css_class("key-prefix")
+            prefix.set_size_request(42, -1)
+            prefix.set_valign(Gtk.Align.CENTER)
+            widgets.append(prefix)
+        widgets += [name_label, summary, record, keys, edit]
 
         cmd_btn = None
         if with_command:
             cmd_btn = Gtk.Button(label="Cmd")
+            cmd_btn.add_css_class("ghost")
             cmd_btn.set_tooltip_text(
                 f"Run a command when {slot} is pressed instead of typing "
                 f"(uses the {omen_key.key_accel(slot)} shortcut)"
@@ -498,6 +1534,7 @@ class MacroWindow(Gtk.ApplicationWindow):
             widgets.append(cmd_btn)
 
         clear = Gtk.Button(label="Clear")
+        clear.add_css_class("ghost")
         clear.set_tooltip_text(f"Remove the macro for {slot}")
         if with_command:
             clear.set_tooltip_text(
@@ -506,7 +1543,18 @@ class MacroWindow(Gtk.ApplicationWindow):
         clear.connect("clicked", lambda _btn, s=slot: self._on_clear_clicked(s))
         widgets.append(clear)
 
+        self._set_accessible_label(record, f"Record {slot}")
+        self._set_accessible_label(keys, f"Type {slot} keys by hand")
+        self._set_accessible_label(edit, f"Edit {slot} macro")
+        if cmd_btn is not None:
+            self._set_accessible_label(cmd_btn, f"Set {slot} command")
+        self._set_accessible_label(
+            clear,
+            f"Clear {slot} macro and command" if with_command
+            else f"Clear {slot}")
         for widget in widgets:
+            if isinstance(widget, Gtk.Button):
+                widget.set_valign(Gtk.Align.CENTER)
             box.append(widget)
         row.set_child(box)
         listbox.append(row)
@@ -520,16 +1568,19 @@ class MacroWindow(Gtk.ApplicationWindow):
         }
 
     def _build_spacing_row(self) -> Gtk.Widget:
-        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        box.set_margin_top(6)
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        box.set_margin_top(8)
+        box.set_margin_bottom(2)
 
         label = Gtk.Label(label="Spacing between key presses (ms)", xalign=0)
+        label.add_css_class("row-label")
         label.set_hexpand(True)
 
         self.spacing = Gtk.SpinButton.new_with_range(0, MAX_SPACING_MS, 10)
         self.spacing.set_digits(0)
         self.spacing.set_numeric(True)
         self.spacing.set_value(DEFAULT_SPACING_MS)
+        self.spacing.set_size_request(110, -1)
         self.spacing.set_tooltip_text(
             "Delay the EC inserts between chords when it replays the macro "
             f"(0-{MAX_SPACING_MS} ms). Saves and applies as you change it."
@@ -554,14 +1605,16 @@ class MacroWindow(Gtk.ApplicationWindow):
 
     def _build_advanced(self) -> Gtk.Widget:
         expander = Gtk.Expander(label="Advanced: Ctrl / Alt / Shift / Fn + P1-P6")
+        expander.add_css_class("omen-expander")
         expander.set_expanded(False)
 
         inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         inner.set_margin_top(6)
+        inner.set_margin_bottom(2)
 
         hint = Gtk.Label(xalign=0)
         hint.set_wrap(True)
-        hint.add_css_class("dim-label")
+        hint.add_css_class("hint")
         hint.set_text(
             "These slots fire when the macro key is pressed together with the "
             "modifier. They are independent of the Ctrl/Alt/Shift/Fn keys "
@@ -580,13 +1633,16 @@ class MacroWindow(Gtk.ApplicationWindow):
 
     # -- profiles ----------------------------------------------------------
     def _build_profile_row(self) -> Gtk.Widget:
-        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        """OEM-style 'PROFILE [Default] New Rename Delete' group (titlebar)."""
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        box.set_valign(Gtk.Align.CENTER)
 
-        label = Gtk.Label(label="Profile:", xalign=0)
+        label = Gtk.Label(label="PROFILE", xalign=0)
+        label.add_css_class("eyebrow")
         box.append(label)
 
         self.profile_combo = Gtk.ComboBoxText()
-        self.profile_combo.set_hexpand(True)
+        self.profile_combo.set_size_request(138, 32)
         self.profile_combo.set_tooltip_text(
             "Switching profiles applies that profile immediately."
         )
@@ -594,14 +1650,21 @@ class MacroWindow(Gtk.ApplicationWindow):
         box.append(self.profile_combo)
 
         new_btn = Gtk.Button(label="New")
+        new_btn.add_css_class("ghost")
         new_btn.set_tooltip_text("Create a profile as a copy of the current one")
         new_btn.connect("clicked", self._on_profile_new)
         rename_btn = Gtk.Button(label="Rename")
+        rename_btn.add_css_class("ghost")
         rename_btn.set_tooltip_text("Rename the current profile")
         rename_btn.connect("clicked", self._on_profile_rename)
         delete_btn = Gtk.Button(label="Delete")
+        delete_btn.add_css_class("ghost")
+        delete_btn.add_css_class("danger")
         delete_btn.set_tooltip_text("Delete the current profile")
         delete_btn.connect("clicked", self._on_profile_delete)
+        self._set_accessible_label(new_btn, "Create a profile")
+        self._set_accessible_label(rename_btn, "Rename the current profile")
+        self._set_accessible_label(delete_btn, "Delete the current profile")
         for btn in (new_btn, rename_btn, delete_btn):
             box.append(btn)
         return box
@@ -658,21 +1721,112 @@ class MacroWindow(Gtk.ApplicationWindow):
         self._refresh_profile_combo()
         self._persist(f"Switched to profile {name}.")
 
+    # -- dialogs -----------------------------------------------------------
+    def _dialog_window(self, title: str, width: int,
+                       height: int = -1) -> Gtk.Window:
+        """Modal OEM-styled dialog shell.
+
+        Still constructs a plain ``Gtk.Window``: the integration test patches
+        ``gui.Gtk.Window`` to record dialogs, so every dialog must go through
+        that name.  The titlebar is decorative; the window title itself is
+        unchanged (tests look it up).
+        """
+        dialog = Gtk.Window(transient_for=self, modal=True, title=title)
+        dialog.add_css_class("omen-dialog")
+        dialog.set_default_size(width, height)
+        dialog.set_titlebar(self._dialog_titlebar(title))
+        return dialog
+
+    @staticmethod
+    def _dialog_titlebar(title: str) -> Gtk.Widget:
+        header = Gtk.HeaderBar()
+        header.add_css_class("omen-titlebar")
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        mark = Gtk.Label(label="◆")
+        mark.add_css_class("brand-mark")
+        box.append(mark)
+        label = Gtk.Label(label=title.upper(), xalign=0)
+        label.add_css_class("dialog-title")
+        box.append(label)
+        header.set_title_widget(box)
+        return header
+
+    @staticmethod
+    def _set_accessible_label(widget: Gtk.Widget, label: str) -> None:
+        """Give a repeating button a unique name for screen readers."""
+        try:
+            widget.update_property([Gtk.AccessibleProperty.LABEL], [label])
+        except (AttributeError, TypeError):
+            pass
+
+    def _dialog_body(self) -> Gtk.Box:
+        """Padded vertical content box shared by every dialog."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.add_css_class("dialog-body")
+        for side in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{side}")(16)
+        return box
+
+    def _confirm_dialog(self, title: str, message: str, ok_label: str,
+                        on_ok) -> None:
+        """Destructive-action confirmation in the same OEM dialog style."""
+        dialog = self._dialog_window(title, 430)
+        box = self._dialog_body()
+        heading = Gtk.Label(label="CONFIRM", xalign=0)
+        heading.add_css_class("dialog-heading")
+        box.append(heading)
+        label = Gtk.Label(label=message, xalign=0)
+        label.set_wrap(True)
+        label.add_css_class("hint")
+        box.append(label)
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        buttons.set_halign(Gtk.Align.END)
+        cancel = Gtk.Button(label="Cancel")
+        cancel.add_css_class("ghost")
+        ok = Gtk.Button(label=ok_label)
+        ok.add_css_class("suggested-action")
+        buttons.append(cancel)
+        buttons.append(ok)
+        box.append(buttons)
+        dialog.set_child(box)
+
+        def done(confirmed: bool) -> None:
+            if confirmed:
+                on_ok()
+            dialog.close()
+
+        cancel.connect("clicked", lambda _b: done(False))
+        ok.connect("clicked", lambda _b: done(True))
+        dialog.connect("map", lambda _w: cancel.grab_focus())
+        dialog.present()
+
     def _profile_dialog(self, title: str, initial: str, ok_label: str,
                         on_ok) -> None:
         """Small modal text dialog; on_ok(text) runs on confirmation."""
-        dialog = Gtk.Window(transient_for=self, modal=True, title=title)
-        dialog.set_default_size(360, -1)
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        for side in ("top", "bottom", "start", "end"):
-            getattr(box, f"set_margin_{side}")(12)
+        dialog = self._dialog_window(title, 380)
+        box = self._dialog_body()
+        heading = Gtk.Label(label="PROFILE NAME", xalign=0)
+        heading.add_css_class("dialog-heading")
+        box.append(heading)
         entry = Gtk.Entry()
         entry.set_hexpand(True)
         entry.set_text(initial)
         box.append(entry)
+        error = Gtk.Label(xalign=0)
+        error.set_wrap(True)
+        error.add_css_class("banner")
+        error.add_css_class("banner-error")
+        error.set_visible(False)
+        box.append(error)
+
+        def show_error(text: str = "") -> None:
+            error.set_text(text)
+            error.set_visible(bool(text))
+
         buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         buttons.set_halign(Gtk.Align.END)
         cancel = Gtk.Button(label="Cancel")
+        cancel.add_css_class("ghost")
         ok = Gtk.Button(label=ok_label)
         ok.add_css_class("suggested-action")
         buttons.append(cancel)
@@ -685,13 +1839,14 @@ class MacroWindow(Gtk.ApplicationWindow):
                 try:
                     on_ok(entry.get_text())
                 except (OSError, ValueError) as exc:
-                    self._set_banner(f"{title}: {exc}", "banner-error")
+                    show_error(f"{title}: {exc}")
                     return
             dialog.close()
 
         cancel.connect("clicked", lambda _b: done(False))
         ok.connect("clicked", lambda _b: done(True))
         entry.connect("activate", lambda _e: done(True))
+        dialog.connect("map", lambda _w: entry.grab_focus())
         dialog.present()
 
     def _on_profile_new(self, _button) -> None:
@@ -733,34 +1888,44 @@ class MacroWindow(Gtk.ApplicationWindow):
             self._set_banner("Cannot delete the only profile.", "banner-error")
             return
         old = self._profile_name
-        try:
-            if profiles.get_active(self._root) == old:
-                self._switch_profile([n for n in names if n != old][0])
-            profiles.delete_profile(self._root, old)
-            self._auto_prune_profile(old)
-        except (OSError, ValueError) as exc:
-            self._set_banner(
-                f"Could not delete profile {old!r}: {exc}", "banner-error"
-            )
-            return
-        self._refresh_profile_combo()
-        self._refresh_auto_status()
-        if self._profile_name not in profiles.list_profiles(self._root):
-            # The daemon may have moved the pointer while we were open;
-            # never leave the window showing a profile that no longer exists.
-            active = profiles.get_active(self._root)
-            if active and active != self._profile_name:
-                self._switch_profile(active)
-                self._set_status(
-                    f"Deleted {old}. Now showing active profile {active}.")
+
+        def delete_now() -> None:
+            try:
+                if profiles.get_active(self._root) == old:
+                    self._switch_profile([n for n in names if n != old][0])
+                profiles.delete_profile(self._root, old)
+                self._auto_prune_profile(old)
+            except (OSError, ValueError) as exc:
+                self._set_banner(
+                    f"Could not delete profile {old!r}: {exc}", "banner-error"
+                )
                 return
-        self._set_status(f"Deleted profile {old}.")
+            self._refresh_profile_combo()
+            self._refresh_auto_status()
+            if self._profile_name not in profiles.list_profiles(self._root):
+                # The daemon may have moved the pointer while we were open;
+                # never leave the window showing a profile that no longer
+                # exists.
+                active = profiles.get_active(self._root)
+                if active and active != self._profile_name:
+                    self._switch_profile(active)
+                    self._set_status(
+                        f"Deleted {old}. Now showing active profile {active}.")
+                    return
+            self._set_status(f"Deleted profile {old}.")
+
+        self._confirm_dialog(
+            "Delete profile",
+            f"Delete the profile {old!r}? Its macros and any auto-switch "
+            "rules that point at it are removed and cannot be restored.",
+            "Delete", delete_now)
 
     # -- auto-switch -----------------------------------------------------
     AUTO_UNIT = "omen-macro-auto.service"
 
     def _build_auto_section(self) -> Gtk.Widget:
         self.auto_expander = Gtk.Expander(label="Auto-switch profiles (optional)")
+        self.auto_expander.add_css_class("omen-expander")
         self.auto_expander.set_expanded(False)
 
         inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -768,7 +1933,7 @@ class MacroWindow(Gtk.ApplicationWindow):
 
         hint = Gtk.Label(xalign=0)
         hint.set_wrap(True)
-        hint.add_css_class("dim-label")
+        hint.add_css_class("hint")
         hint.set_text(
             "When on, a background service watches the focused app and switches "
             "to the mapped profile. Your manual switches always win until "
@@ -787,7 +1952,7 @@ class MacroWindow(Gtk.ApplicationWindow):
         self.auto_switch.connect("notify::active", self._on_auto_toggled)
         enable_row.append(self.auto_switch)
         self.auto_state = Gtk.Label(xalign=0)
-        self.auto_state.add_css_class("dim-label")
+        self.auto_state.add_css_class("hint")
         self.auto_state.set_hexpand(True)
         enable_row.append(self.auto_state)
         inner.append(enable_row)
@@ -1002,22 +2167,31 @@ class MacroWindow(Gtk.ApplicationWindow):
             self.auto_rules_list.remove(row)
         for index, rule in enumerate(self._auto_rules):
             list_row = Gtk.ListBoxRow()
+            list_row.add_css_class("rule-row")
             box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-            for side in ("top", "bottom", "start", "end"):
-                getattr(box, f"set_margin_{side}")(2)
+            box.set_margin_top(4)
+            box.set_margin_bottom(4)
+            box.set_margin_start(2)
+            box.set_margin_end(2)
             text = Gtk.Label(
                 label=f"\"{rule['match']}\" -> {rule['profile']}", xalign=0)
             text.set_hexpand(True)
             text.set_ellipsize(Pango.EllipsizeMode.END)
             up = Gtk.Button(label="^")
+            up.add_css_class("ghost")
             up.set_tooltip_text("Move rule up (earlier rules win)")
             up.connect("clicked", lambda _b, i=index: self._on_auto_rule_move(i, -1))
             down = Gtk.Button(label="v")
+            down.add_css_class("ghost")
             down.set_tooltip_text("Move rule down")
             down.connect("clicked", lambda _b, i=index: self._on_auto_rule_move(i, 1))
             remove = Gtk.Button(label="Remove")
+            remove.add_css_class("ghost")
             remove.connect("clicked",
                            lambda _b, i=index: self._on_auto_rule_remove(i))
+            self._set_accessible_label(up, f"Move rule {index + 1} up")
+            self._set_accessible_label(down, f"Move rule {index + 1} down")
+            self._set_accessible_label(remove, f"Remove rule {index + 1}")
             for widget in (text, up, down, remove):
                 box.append(widget)
             list_row.set_child(box)
@@ -1078,26 +2252,39 @@ class MacroWindow(Gtk.ApplicationWindow):
         row.add_css_class("macro-row")
 
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        for side in ("top", "bottom", "start", "end"):
-            getattr(box, f"set_margin_{side}")(4)
+        box.set_margin_top(6)
+        box.set_margin_bottom(6)
+        box.set_margin_start(6)
+        box.set_margin_end(2)
 
-        name_label = Gtk.Label(label="OMEN", xalign=0)
-        name_label.add_css_class("macro-key")
-        name_label.set_size_request(96, -1)
+        name_label = Gtk.Label(label="OMEN")
+        name_label.add_css_class("key-badge")
+        name_label.add_css_class("omen-key-badge")
+        name_label.set_size_request(44, 34)
+        name_label.set_xalign(0.5)
+        name_label.set_valign(Gtk.Align.CENTER)
 
         summary = Gtk.Label(label="no binding", xalign=0)
         summary.set_hexpand(True)
         summary.set_ellipsize(Pango.EllipsizeMode.END)
+        summary.add_css_class("macro-summary")
+        summary.set_valign(Gtk.Align.CENTER)
 
         set_btn = Gtk.Button(label="Set")
+        set_btn.add_css_class("ghost")
         set_btn.set_tooltip_text("Set the command the OMEN logo key runs")
         set_btn.connect("clicked", self._on_omen_set_clicked)
 
         clear_btn = Gtk.Button(label="Clear")
+        clear_btn.add_css_class("ghost")
         clear_btn.set_tooltip_text("Remove the OMEN key shortcut")
         clear_btn.connect("clicked", self._on_omen_remove_clicked)
 
+        self._set_accessible_label(set_btn, "Set OMEN key command")
+        self._set_accessible_label(clear_btn, "Clear OMEN key binding")
         for widget in (name_label, summary, set_btn, clear_btn):
+            if isinstance(widget, Gtk.Button):
+                widget.set_valign(Gtk.Align.CENTER)
             box.append(widget)
         row.set_child(box)
         listbox.append(row)
@@ -1136,14 +2323,15 @@ class MacroWindow(Gtk.ApplicationWindow):
         """
         is_omen = key == "OMEN"
         title = "OMEN key command" if is_omen else f"{key} command"
-        dialog = Gtk.Window(transient_for=self, modal=True, title=title)
-        dialog.set_default_size(420, -1)
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        for side in ("top", "bottom", "start", "end"):
-            getattr(box, f"set_margin_{side}")(12)
+        dialog = self._dialog_window(title, 470)
+        box = self._dialog_body()
 
+        heading = Gtk.Label(label="COMMAND", xalign=0)
+        heading.add_css_class("dialog-heading")
+        box.append(heading)
         label = Gtk.Label(xalign=0)
         label.set_wrap(True)
+        label.add_css_class("hint")
         if is_omen:
             label.set_text(
                 "Command run when the OMEN logo key is pressed "
@@ -1154,7 +2342,7 @@ class MacroWindow(Gtk.ApplicationWindow):
                 f"Command run when {key} is pressed (it sends "
                 f"{omen_key.key_accel(key)}). While a command is set, the "
                 "typing macro for this key is left out of the EC upload: "
-                "press Apply to EC to make the switch take effect."
+                "re-apply the profile to make the switch take effect."
             )
         box.append(label)
 
@@ -1172,10 +2360,21 @@ class MacroWindow(Gtk.ApplicationWindow):
                        (omen_key.OMEN_DEFAULT_COMMAND if is_omen else ""))
         entry.set_placeholder_text("e.g. firefox" if not is_omen else "e.g. omen-macro")
         box.append(entry)
+        error = Gtk.Label(xalign=0)
+        error.set_wrap(True)
+        error.add_css_class("banner")
+        error.add_css_class("banner-error")
+        error.set_visible(False)
+        box.append(error)
+
+        def show_error(text: str = "") -> None:
+            error.set_text(text)
+            error.set_visible(bool(text))
 
         buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         buttons.set_halign(Gtk.Align.END)
         cancel = Gtk.Button(label="Cancel")
+        cancel.add_css_class("ghost")
         ok = Gtk.Button(label="Bind")
         ok.add_css_class("suggested-action")
         buttons.append(cancel)
@@ -1187,10 +2386,9 @@ class MacroWindow(Gtk.ApplicationWindow):
             if bind:
                 command = entry.get_text().strip()
                 if not command:
-                    self._set_banner(
-                        f"{key}: type a command first.", "banner-error"
-                    )
+                    show_error(f"{key}: type a command first.")
                     return
+                show_error("")
                 old = self.commands.get(key)
                 self.commands[key] = command
                 if key == "OMEN":
@@ -1203,12 +2401,15 @@ class MacroWindow(Gtk.ApplicationWindow):
                         del self.commands[key]
                     else:
                         self.commands[key] = old
+                    show_error("could not save or send the command - see the "
+                               "message in the main window")
                     return
             dialog.close()
 
         cancel.connect("clicked", lambda _b: done(False))
         ok.connect("clicked", lambda _b: done(True))
         entry.connect("activate", lambda _e: done(True))
+        dialog.connect("map", lambda _w: entry.grab_focus())
         dialog.present()
 
     def _open_keys_dialog(self, slot: str) -> None:
@@ -1220,15 +2421,15 @@ class MacroWindow(Gtk.ApplicationWindow):
         modifiers, pick the key, Add chord. OK commits and persists.
         """
         self._finish_recording()
-        dialog = Gtk.Window(transient_for=self, modal=True, title=f"{slot} keys")
-        dialog.set_default_size(480, -1)
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        for side in ("top", "bottom", "start", "end"):
-            getattr(box, f"set_margin_{side}")(12)
+        dialog = self._dialog_window(f"{slot} keys", 620)
+        box = self._dialog_body()
 
+        heading = Gtk.Label(label="CHORDS", xalign=0)
+        heading.add_css_class("dialog-heading")
+        box.append(heading)
         hint = Gtk.Label(xalign=0)
         hint.set_wrap(True)
-        hint.add_css_class("dim-label")
+        hint.add_css_class("hint")
         hint.set_text(
             "Tick the modifiers, pick the key, Add chord. Use this for "
             "shortcuts the system grabs before recording sees them "
@@ -1250,7 +2451,7 @@ class MacroWindow(Gtk.ApplicationWindow):
                 chords_box.remove(child)
             if not working:
                 empty = Gtk.Label(label="no chords yet", xalign=0)
-                empty.add_css_class("dim-label")
+                empty.add_css_class("hint")
                 chords_box.append(empty)
             for i, chord in enumerate(working):
                 row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -1258,10 +2459,12 @@ class MacroWindow(Gtk.ApplicationWindow):
                 text.set_hexpand(True)
                 text.set_ellipsize(Pango.EllipsizeMode.END)
                 remove = Gtk.Button(label="Remove")
+                remove.add_css_class("ghost")
                 remove.connect(
                     "clicked",
                     lambda _b, idx=i: (working.pop(idx), refresh_chords()),
                 )
+                self._set_accessible_label(remove, f"Remove chord {i + 1}")
                 row.append(text)
                 row.append(remove)
                 chords_box.append(row)
@@ -1287,6 +2490,18 @@ class MacroWindow(Gtk.ApplicationWindow):
         add_btn = Gtk.Button(label="Add chord")
         add_row.append(add_btn)
         box.append(add_row)
+        dialog.connect("map", lambda _w: key_combo.grab_focus())
+
+        error = Gtk.Label(xalign=0)
+        error.set_wrap(True)
+        error.add_css_class("banner")
+        error.add_css_class("banner-error")
+        error.set_visible(False)
+        box.append(error)
+
+        def show_error(text: str = "") -> None:
+            error.set_text(text)
+            error.set_visible(bool(text))
 
         def key_text() -> str:
             entry = key_combo.get_child()
@@ -1297,9 +2512,9 @@ class MacroWindow(Gtk.ApplicationWindow):
             try:
                 chord = build_chord(mods, key_text())
             except codec.MacroError as exc:
-                self._set_banner(f"{slot}: {exc}", "banner-error")
+                show_error(f"{slot}: {exc}")
                 return
-            self._set_banner("", "")
+            show_error("")
             working.append(chord)
             for check in mod_checks.values():
                 check.set_active(False)
@@ -1313,8 +2528,10 @@ class MacroWindow(Gtk.ApplicationWindow):
         buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         buttons.set_halign(Gtk.Align.END)
         reset = Gtk.Button(label="Reset")
+        reset.add_css_class("ghost")
         reset.set_tooltip_text("Throw away dialog edits, back to the saved chords")
         cancel = Gtk.Button(label="Cancel")
+        cancel.add_css_class("ghost")
         ok = Gtk.Button(label="OK")
         ok.add_css_class("suggested-action")
         buttons.append(reset)
@@ -1337,14 +2554,18 @@ class MacroWindow(Gtk.ApplicationWindow):
                         self.slots.pop(slot, None)
                     else:
                         self.slots[slot] = old
+                    show_error("could not save or send the macro - see the "
+                               "message in the main window")
                     return
             dialog.close()
 
-        reset.connect(
-            "clicked",
-            lambda _b: (working.clear(), working.extend([list(c) for c in saved]),
-                        refresh_chords(), self._set_banner("", "")),
-        )
+        def reset_chords(_b) -> None:
+            working.clear()
+            working.extend([list(c) for c in saved])
+            refresh_chords()
+            show_error("")
+
+        reset.connect("clicked", reset_chords)
         cancel.connect("clicked", lambda _b: done(False))
         ok.connect("clicked", lambda _b: done(True))
         dialog.present()
@@ -1362,17 +2583,19 @@ class MacroWindow(Gtk.ApplicationWindow):
         the same persist path as the Keys dialog (save profile + upload).
         """
         self._finish_recording()
-        dialog = Gtk.Window(transient_for=self, modal=True,
-                            title=f"Edit {slot} macro")
-        dialog.set_default_size(620, 520)
+        dialog = self._dialog_window(f"Edit {slot} macro", 620, 520)
 
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        for side in ("top", "bottom", "start", "end"):
-            getattr(outer, f"set_margin_{side}")(12)
+        # The steps list below keeps its exact widget hierarchy: the
+        # ScrolledWindow holds the Box of row Boxes (Entry + Split/Insert/
+        # Delete).  Only this outer container and the labels around it change.
+        outer = self._dialog_body()
 
+        heading = Gtk.Label(label="STEPS", xalign=0)
+        heading.add_css_class("dialog-heading")
+        outer.append(heading)
         hint = Gtk.Label(xalign=0)
         hint.set_wrap(True)
-        hint.add_css_class("dim-label")
+        hint.add_css_class("hint")
         hint.set_text(
             "One row is one step: the keys the EC presses together. Join keys "
             "with + (Ctrl+Shift+t); a space or comma separates steps "
@@ -1399,7 +2622,7 @@ class MacroWindow(Gtk.ApplicationWindow):
 
         preview = Gtk.Label(xalign=0)
         preview.set_wrap(True)
-        preview.add_css_class("dim-label")
+        preview.add_css_class("hint")
         outer.append(preview)
 
         error_label = Gtk.Label(xalign=0)
@@ -1412,8 +2635,10 @@ class MacroWindow(Gtk.ApplicationWindow):
         buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         buttons.set_halign(Gtk.Align.END)
         reset = Gtk.Button(label="Reset")
+        reset.add_css_class("ghost")
         reset.set_tooltip_text("Throw away dialog edits, back to the saved steps")
         cancel = Gtk.Button(label="Cancel")
+        cancel.add_css_class("ghost")
         ok = Gtk.Button(label="OK")
         ok.add_css_class("suggested-action")
         buttons.append(reset)
@@ -1460,8 +2685,10 @@ class MacroWindow(Gtk.ApplicationWindow):
                 )
             try:
                 steps = parse_editor_entries(texts)
-            except codec.MacroError as exc:
-                preview.set_text(f"cannot preview yet - {exc}")
+            except codec.MacroError:
+                # The red label below carries the detailed message; do not
+                # repeat the same text in the preview line.
+                preview.set_text("cannot preview yet - fix the invalid step")
                 return
             # The rows parse again: drop an error left over from a failed OK,
             # otherwise the red banner contradicts the green preview.
@@ -1503,13 +2730,13 @@ class MacroWindow(Gtk.ApplicationWindow):
                     label="no steps yet - use Add step to start a macro",
                     xalign=0,
                 )
-                empty.add_css_class("dim-label")
+                empty.add_css_class("hint")
                 steps_box.append(empty)
             for index, text in enumerate(texts):
                 row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
 
                 number = Gtk.Label(label=f"{index + 1}.", xalign=1)
-                number.add_css_class("dim-label")
+                number.add_css_class("text-dim")
                 number.set_size_request(32, -1)
 
                 entry = Gtk.Entry()
@@ -1532,6 +2759,11 @@ class MacroWindow(Gtk.ApplicationWindow):
                 delete.set_tooltip_text("Remove this step from the macro")
                 delete.connect("clicked", lambda _b, i=index: do_delete(i))
 
+                self._set_accessible_label(split, f"Split step {index + 1}")
+                self._set_accessible_label(
+                    insert, f"Insert a step after step {index + 1}")
+                self._set_accessible_label(
+                    delete, f"Delete step {index + 1}")
                 row.append(number)
                 row.append(entry)
                 row.append(split)
@@ -1665,10 +2897,15 @@ class MacroWindow(Gtk.ApplicationWindow):
             self.commands["OMEN"] = old
 
     def _build_status_area(self) -> Gtk.Widget:
-        frame = Gtk.Frame(label="EC status")
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        for side in ("top", "bottom", "start", "end"):
-            getattr(box, f"set_margin_{side}")(6)
+        """Always-visible diagnostic bar: monospace readout on a raised strip."""
+        bar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        bar.add_css_class("status-bar")
+
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        eyebrow = Gtk.Label(label="STATUS", xalign=0)
+        eyebrow.add_css_class("eyebrow")
+        head.append(eyebrow)
+        bar.append(head)
 
         self.status = Gtk.Label(label="", xalign=0)
         self.status.set_wrap(True)
@@ -1676,16 +2913,19 @@ class MacroWindow(Gtk.ApplicationWindow):
         self.status.set_selectable(True)
         self.status.add_css_class("status")
 
-        box.append(self.status)
-        frame.set_child(box)
-        return frame
+        bar.append(self.status)
+        return bar
 
     def _build_footer(self) -> Gtk.Widget:
-        footer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        footer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
 
         hint = Gtk.Label(xalign=0)
         hint.set_wrap(True)
-        hint.add_css_class("dim-label")
+        hint.add_css_class("hint")
+        hint.set_margin_start(20)
+        hint.set_margin_end(20)
+        hint.set_margin_top(4)
+        hint.set_margin_bottom(6)
         hint.set_text(
             "Every change saves the current profile and sends it to the "
             "keyboard automatically. Switching profiles applies that profile."
@@ -1693,8 +2933,10 @@ class MacroWindow(Gtk.ApplicationWindow):
         footer.append(hint)
 
         bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        bar.add_css_class("footer-bar")
 
         self.reapply_btn = Gtk.Button(label="Re-apply")
+        self.reapply_btn.add_css_class("ghost")
         self.reapply_btn.set_tooltip_text(
             "Re-send the current profile to the keyboard and shortcuts "
             "(recovery if the keys stop responding)."
@@ -1702,6 +2944,8 @@ class MacroWindow(Gtk.ApplicationWindow):
         self.reapply_btn.connect("clicked", lambda _b: self._persist("Re-applied."))
 
         self.defaults_btn = Gtk.Button(label="Load defaults")
+        self.defaults_btn.add_css_class("ghost")
+        self.defaults_btn.add_css_class("danger")
         self.defaults_btn.set_tooltip_text(
             "Replace this window with the stock numpad layout, saved and "
             "sent immediately."
@@ -1848,6 +3092,7 @@ class MacroWindow(Gtk.ApplicationWindow):
         row = self.rows[slot]
         row["summary"].set_text(text)
         row["summary"].set_tooltip_text(text)
+        row["summary"].remove_css_class("is-empty")
         if rec.error:
             self._set_banner(f"{slot}: {rec.error}", "banner-error")
         else:
@@ -1870,8 +3115,17 @@ class MacroWindow(Gtk.ApplicationWindow):
         else:
             text = codec.describe_entry(self.slots.get(slot) or [])
             tip = f"{slot} is empty" if text == "empty" else text
+        empty = text == "empty"
         row["summary"].set_text(text)
         row["summary"].set_tooltip_text(tip)
+        if empty:
+            row["summary"].add_css_class("is-empty")
+        else:
+            row["summary"].remove_css_class("is-empty")
+        if command:
+            row["row"].add_css_class("has-command")
+        else:
+            row["row"].remove_css_class("has-command")
 
     # -- config ------------------------------------------------------------
     def _config(self) -> dict:
@@ -2001,8 +3255,11 @@ class MacroWindow(Gtk.ApplicationWindow):
             written = write_profile(profile, sysfs)
         except (FileNotFoundError, NotADirectoryError):
             diagnosis = boot_diag.diagnose_missing_interface(sysfs)
+            self._diagnosis = diagnosis
+            self._set_device_state(False)
             self._set_banner(f"{MSG_NO_HW} - {diagnosis.summary}", "banner-error")
             self._set_status(f"{path} does not exist.\n\n{diagnosis.hint}")
+            self._refresh_ec_state()
             return False, ""
         except PermissionError:
             self._set_banner(MSG_NO_PERM, "banner-error")
@@ -2012,6 +3269,8 @@ class MacroWindow(Gtk.ApplicationWindow):
             self._set_banner(f"EC rejected the profile: {exc}", "banner-error")
             self._set_status(f"macro_status: {read_status(sysfs)}")
             return False, ""
+        self._diagnosis = None
+        self._set_device_state(True)
         status = (f"wrote {written} bytes to {path}\n"
                   f"macro_status: {read_status(sysfs)}")
         skipped = [k for k in omen_key.COMMANDABLE_PKEYS if k in self.commands]
@@ -2049,26 +3308,92 @@ class MacroWindow(Gtk.ApplicationWindow):
         return True
 
     def _on_defaults_clicked(self, _button) -> None:
+        """Ask first: this replaces every macro in the current profile."""
         self._finish_recording()
-        self._loading = True
-        try:
-            self.slots = {
-                name: [list(chord) for chord in chords]
-                for name, chords in codec.NUMPAD_DEFAULT.items()
-            }
-            self.spacing.set_value(DEFAULT_SPACING_MS)
-        finally:
-            self._loading = False
-        self._persist("Loaded the stock numpad layout.")
+
+        def load_defaults() -> None:
+            self._loading = True
+            try:
+                self.slots = {
+                    name: [list(chord) for chord in chords]
+                    for name, chords in codec.NUMPAD_DEFAULT.items()
+                }
+                self.spacing.set_value(DEFAULT_SPACING_MS)
+            finally:
+                self._loading = False
+            self._persist("Loaded the stock numpad layout.")
+
+        self._confirm_dialog(
+            "Load defaults",
+            "Replace this profile's macros with the stock numpad layout? "
+            "The macros in the current profile are overwritten and cannot be "
+            "restored.",
+            "Load defaults", load_defaults)
 
     # -- status ------------------------------------------------------------
+    @staticmethod
+    def _ec_verdict(text: str) -> tuple[str, str]:
+        """Sidebar EC pill text + css class, derived from the status readout.
+
+        The text carries the state (not only the colour), so the pill still
+        reads correctly for colour-blind users and in screenshots.
+        """
+        if "applied=1" in text:
+            return "APPLIED", "ok"
+        if "applied=0" in text:
+            return "NOT APPLIED", "warn"
+        if MSG_NO_HW in text or "does not exist" in text:
+            return "UNAVAILABLE", "warn"
+        if "Nothing has been applied" in text or "not written" in text:
+            return "NOT APPLIED", "warn"
+        return "UNKNOWN", "off"
+
+    def _set_ec_state(self, verdict: str, css_class: str) -> None:
+        """Paint the sidebar EC pill (text + dot) for a known state."""
+        pill = getattr(self, "ec_pill", None)
+        dot = getattr(self, "ec_dot", None)
+        if pill is None:
+            return
+        if pill.get_text() != verdict:
+            pill.set_text(verdict)
+        pill.set_tooltip_text(f"EC status: {verdict}")
+        for name in ("ok", "warn", "off"):
+            pill.remove_css_class(name)
+            if dot is not None:
+                dot.remove_css_class(name)
+        pill.add_css_class(css_class)
+        if dot is not None:
+            dot.add_css_class(css_class)
+
+    def _refresh_ec_state(self) -> None:
+        """Derive the EC pill from the real hardware diagnosis + readouts.
+
+        The missing-interface case is authoritative: a diagnosis means the EC
+        cannot have applied anything, whatever the last status text says.
+        """
+        if getattr(self, "_diagnosis", None) is not None:
+            self._set_ec_state("UNAVAILABLE", "warn")
+            return
+        text = ""
+        status = getattr(self, "status", None)
+        if status is not None:
+            text = status.get_text()
+        banner = getattr(self, "banner", None)
+        if banner is not None and banner.get_visible():
+            text = f"{text}\n{banner.get_text()}"
+        verdict, css_class = self._ec_verdict(text)
+        if verdict != "UNKNOWN":
+            self._set_ec_state(verdict, css_class)
+
     def _set_status(self, text: str) -> None:
         self.status.set_text(text)
+        self._refresh_ec_state()
 
     def _set_banner(self, text: str, css_class: str = "") -> None:
         if not text:
             self.banner.set_visible(False)
             self.banner.set_text("")
+            self._refresh_ec_state()
             return
         self.banner.remove_css_class("banner-error")
         self.banner.remove_css_class("banner-warning")
@@ -2076,6 +3401,7 @@ class MacroWindow(Gtk.ApplicationWindow):
             self.banner.add_css_class(css_class)
         self.banner.set_text(text)
         self.banner.set_visible(True)
+        self._refresh_ec_state()
 
 
 class MacroApp(Gtk.Application):
@@ -2093,15 +3419,10 @@ class MacroApp(Gtk.Application):
         self._window.present()
 
     def _install_css(self) -> None:
+        """Install the OEM stylesheet (once) and prefer the dark widget theme."""
         if self._css_installed:
             return
-        display = Gdk.Display.get_default()
-        if display is not None:
-            provider = Gtk.CssProvider()
-            provider.load_from_string(CSS)
-            Gtk.StyleContext.add_provider_for_display(
-                display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
-            )
+        install_css()
         self._css_installed = True
 
 

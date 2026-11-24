@@ -57,6 +57,10 @@ policy in userspace where it can be edited without rebuilding a module.
   numpad layout, or a blank table; `--list-profiles`, `--dry-run`, `--status`.
 * `gui.py` - GTK4 app ("OMEN Macro Keys") with key recording, per-key macros
   and commands, named profiles, optional auto-switch, and EC status readout.
+  Styled after HP's OMEN Gaming Hub (dark chassis, branded title bar, sidebar,
+  cards); the palette lives in a `THEME` dict at the top of the file.
+* `../desktop/omen-macro.svg` - the OMEN app icon, installed into the hicolor
+  icon theme so the app grid entry matches the window.
 * `profiles.py` - named-profile store shared by the GUI, the CLI and the
   boot service (`profiles/<name>.json` plus an `active-profile` pointer).
 * `auto_switch.py` - optional per-user daemon: switches profiles with the
@@ -187,6 +191,12 @@ omen-macro # GUI (also "OMEN Macro Keys" in the app grid)
 
 ![OMEN Macro Keys GUI](screenshot.webp)
 
+The window follows HP's OMEN Gaming Hub look: near-black chassis, a branded
+title bar, an icon sidebar switching between **Macros** and **Auto-switch**,
+card panels with uppercase section headers, and OMEN red for the brand and the
+primary actions. It pins its own Adwaita dark base for the process (unless you
+run a HighContrast theme), so it looks the same whatever desktop theme you use.
+
 Click **Record** on a key, type the sequence, press **Stop**. Recording
 captures *key order only*; the "Spacing between key presses" spinbox sets the
 delay inserted between keystrokes when the EC replays them. **Every change
@@ -227,6 +237,9 @@ so you can repair that step instead of recording the whole macro again:
  254-byte budget. **OK** saves and sends it like every other change; **Reset**
   restores the saved steps and **Cancel** closes without touching the macro.
   If a step cannot be read the dialog says which row to fix and stays open.
+
+
+![The Edit macro dialog](screenshot-editor.webp)
 
 **Keys** is still the fastest way to compose a fixed shortcut from scratch;
 **Edit** is for taking an existing macro apart.
@@ -375,6 +388,15 @@ session, shows no window, and drives the actual Split/Insert/Delete/OK buttons:
 
 ```bash
 DISPLAY=:0 python3 tests/gui_integration.py # prints SKIPPED without a display
+```
+
+The window itself is rendered offscreen by `tests/render_ui.py`: it captures
+every page and dialog to PNG (no window ever becomes visible), runs the
+palette/contrast/layout checks and writes `report.json` - useful before/after
+the styling or layout of the GUI is touched:
+
+```bash
+DISPLAY=:0 python3 tests/render_ui.py --out /tmp/omen-ui
 ```
 
 ## Credits

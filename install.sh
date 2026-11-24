@@ -150,6 +150,10 @@ exec python3 -m omen_macro.auto_switch "$@"
 LAUNCHER
 chmod 755 /usr/local/bin/omen-macro /usr/local/bin/omen-macro-apply /usr/local/bin/omen-macro-auto
 install -Dm644 "${SCRIPT_DIR}/desktop/omen-macro.desktop" /usr/share/applications/omen-macro.desktop
+install -Dm644 "${SCRIPT_DIR}/desktop/omen-macro.svg" \
+	/usr/share/icons/hicolor/scalable/apps/omen-macro.svg
+gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor 2>/dev/null || true
+update-desktop-database -q 2>/dev/null || true
 
 # ---------------------------------------------------------------- 5. config
 # Seeding happens at runtime: the first apply (below) or GUI start migrates a
